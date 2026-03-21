@@ -1,4 +1,4 @@
-# VERSION 12 - Holographic keepout stronger
+# VERSION 13 - Holographic on full white sticker area
 
 from io import BytesIO
 import base64
@@ -86,41 +86,6 @@ def fill_small_holes(img: Image.Image, max_hole_area: int = 10000) -> Image.Imag
     return Image.fromarray(out, "RGBA")
 
 
-def make_inner_mask(contour_img: Image.Image, inset_px: int = 20) -> Image.Image:
-    arr = np.array(contour_img)
-    alpha = arr[:, :, 3]
-
-    kernel = np.ones((inset_px, inset_px), np.uint8)
-    eroded = cv2.erode(alpha, kernel, iterations=1)
-
-    out = np.zeros((alpha.shape[0], alpha.shape[1], 4), dtype=np.uint8)
-    out[:, :, 0:3] = 255
-    out[:, :, 3] = eroded
-    return Image.fromarray(out, "RGBA")
-
-
-def make_design_keepout_mask(design_img: Image.Image, expand_px: int = 14) -> np.ndarray:
-    design_alpha = np.array(design_img)[:, :, 3]
-    solid = np.where(design_alpha > 0, 255, 0).astype(np.uint8)
-
-    kernel = np.ones((expand_px, expand_px), np.uint8)
-    dilated = cv2.dilate(solid, kernel, iterations=1)
-
-    return dilated
-
-
-def make_material_mask(contour_img: Image.Image, design_img: Image.Image) -> Image.Image:
-    inner = np.array(make_inner_mask(contour_img, inset_px=20))[:, :, 3]
-    keepout = make_design_keepout_mask(design_img, expand_px=14)
-
-    material_alpha = cv2.subtract(inner, keepout)
-
-    out = np.zeros((inner.shape[0], inner.shape[1], 4), dtype=np.uint8)
-    out[:, :, 0:3] = 255
-    out[:, :, 3] = material_alpha
-    return Image.fromarray(out, "RGBA")
-
-
 def find_texture(filename: str) -> Path | None:
     exact = BASE_DIR / "textures" / filename
     if exact.exists():
@@ -150,6 +115,28 @@ def load_texture(material: str, size: tuple[int, int]):
     return tex, str(path)
 
 
+def make_white_area_mask(contour_img: Image.Image, design_img: Image.Image, keepout_px: int = 4) -> Image.Image:
+    """
+    Máscara del material holográfico sobre toda la zona blanca:
+    contorno - diseño expandido ligeramente
+    """
+    contour_alpha = np.array(contour_img)[:, :, 3]
+    design_alpha = np.array(design_img)[:, :, 3]
+
+    design_solid = np.where(design_alpha > 0, 255, 0).astype(np.uint8)
+
+    if keepout_px > 0:
+        kernel = np.ones((keepout_px, keepout_px), np.uint8)
+        design_solid = cv2.dilate(design_solid, kernel, iterations=1)
+
+    white_area = cv2.subtract(contour_alpha, design_solid)
+
+    out = np.zeros((white_area.shape[0], white_area.shape[1], 4), dtype=np.uint8)
+    out[:, :, 0:3] = 255
+    out[:, :, 3] = white_area
+    return Image.fromarray(out, "RGBA")
+
+
 def apply_mask_to_texture(texture: Image.Image, mask_img: Image.Image) -> Image.Image:
     tex = texture.copy().convert("RGBA")
     mask_alpha = np.array(mask_img)[:, :, 3]
@@ -164,14 +151,14 @@ def make_material_preview(contour_img: Image.Image, design_img: Image.Image, mat
     if texture is None:
         return None, texture_path
 
-    material_mask = make_material_mask(contour_img, design_img)
+    material_mask = make_white_area_mask(contour_img, design_img, keepout_px=4)
     preview = apply_mask_to_texture(texture, material_mask)
     return preview, texture_path
 
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": 12}
+    return {"ok": True, "version": 13}
 
 
 @app.post("/process-sticker")
@@ -195,7 +182,7 @@ async def process_sticker(
             "debug_material": material,
             "debug_texture_found": material_preview is not None,
             "debug_texture_path": texture_path,
-            "debug_version": 12
+            "debug_version": 13
         })
     except Exception as e:
         return JSONResponse(
