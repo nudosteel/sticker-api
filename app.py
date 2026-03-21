@@ -1,4 +1,4 @@
-# Sticker Wizard - Version 6
+# Sticker Wizard - Version 7
 
 from io import BytesIO
 import base64
@@ -99,23 +99,13 @@ def make_inner_mask(contour_img: Image.Image, inset_px: int = 18) -> Image.Image
     return Image.fromarray(out, "RGBA")
 
 
-def make_white_sticker_base(contour_img: Image.Image) -> Image.Image:
-    alpha = np.array(contour_img)[:, :, 3]
-    out = np.zeros((alpha.shape[0], alpha.shape[1], 4), dtype=np.uint8)
-    out[:, :, 0:3] = 255
-    out[:, :, 3] = alpha
-    return Image.fromarray(out, "RGBA")
-
-
 def load_texture(material: str, size: tuple[int, int]) -> Image.Image | None:
     if material == "holographic":
         path = TEXTURES_DIR / "holographic.png"
         if not path.exists():
             return None
-
         tex = Image.open(path).convert("RGBA")
-        tex = tex.resize(size, Image.Resampling.LANCZOS)
-        return tex
+        return tex.resize(size, Image.Resampling.LANCZOS)
 
     return None
 
@@ -128,20 +118,14 @@ def apply_mask_to_texture(texture: Image.Image, mask_img: Image.Image) -> Image.
     return Image.fromarray(tex_arr, "RGBA")
 
 
-def compose_preview(design_img: Image.Image, contour_img: Image.Image, material: str) -> Image.Image:
-    white_base = make_white_sticker_base(contour_img)
+def make_material_preview(contour_img: Image.Image, material: str) -> Image.Image | None:
     inner_mask = make_inner_mask(contour_img, inset_px=18)
+    texture = load_texture(material, contour_img.size)
 
-    canvas = Image.new("RGBA", design_img.size, (0, 0, 0, 0))
-    canvas.alpha_composite(white_base)
+    if texture is None:
+        return None
 
-    texture = load_texture(material, design_img.size)
-    if texture is not None:
-        textured = apply_mask_to_texture(texture, inner_mask)
-        canvas.alpha_composite(textured)
-
-    canvas.alpha_composite(design_img)
-    return canvas
+    return apply_mask_to_texture(texture, inner_mask)
 
 
 @app.get("/")
@@ -160,13 +144,13 @@ async def process_sticker(
 
         design = trim_transparent(img, padding_ratio=0.10)
         contour = fill_small_holes(design, max_hole_area=10000)
-        preview = compose_preview(design, contour, material)
+        material_preview = make_material_preview(contour, material)
 
         return JSONResponse({
             "ok": True,
             "design_png": to_base64(design),
             "contour_png": to_base64(contour),
-            "preview_png": to_base64(preview)
+            "preview_png": to_base64(material_preview) if material_preview else None
         })
     except Exception as e:
         return JSONResponse(
