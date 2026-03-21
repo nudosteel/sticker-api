@@ -79,14 +79,15 @@ def inner_mask(img):
 
 
 def find_texture():
-    path = BASE_DIR / "textures" / "holographic.png"
+    path = Path("/app/textures/holographic.png")
 
     if path.exists():
         return path
 
-    # fallback search
-    for p in BASE_DIR.rglob("holographic.png"):
-        return p
+    # fallback
+    alt = BASE_DIR / "textures" / "holographic.png"
+    if alt.exists():
+        return alt
 
     return None
 
