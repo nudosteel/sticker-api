@@ -1,4 +1,4 @@
-# VERSION 11 - Holographic mask excludes inner design gaps
+# VERSION 12 - Holographic keepout stronger
 
 from io import BytesIO
 import base64
@@ -86,7 +86,7 @@ def fill_small_holes(img: Image.Image, max_hole_area: int = 10000) -> Image.Imag
     return Image.fromarray(out, "RGBA")
 
 
-def make_inner_mask(contour_img: Image.Image, inset_px: int = 18) -> Image.Image:
+def make_inner_mask(contour_img: Image.Image, inset_px: int = 20) -> Image.Image:
     arr = np.array(contour_img)
     alpha = arr[:, :, 3]
 
@@ -99,11 +99,7 @@ def make_inner_mask(contour_img: Image.Image, inset_px: int = 18) -> Image.Image
     return Image.fromarray(out, "RGBA")
 
 
-def make_design_keepout_mask(design_img: Image.Image, expand_px: int = 8) -> np.ndarray:
-    """
-    Crea una máscara expandida del diseño negro para que el material
-    no se acerque tanto a los bordes del diseño ni entre en huecos pequeños.
-    """
+def make_design_keepout_mask(design_img: Image.Image, expand_px: int = 14) -> np.ndarray:
     design_alpha = np.array(design_img)[:, :, 3]
     solid = np.where(design_alpha > 0, 255, 0).astype(np.uint8)
 
@@ -114,13 +110,8 @@ def make_design_keepout_mask(design_img: Image.Image, expand_px: int = 8) -> np.
 
 
 def make_material_mask(contour_img: Image.Image, design_img: Image.Image) -> Image.Image:
-    """
-    Máscara final del material:
-    - parte del inner mask
-    - resta el área del diseño expandido
-    """
-    inner = np.array(make_inner_mask(contour_img, inset_px=18))[:, :, 3]
-    keepout = make_design_keepout_mask(design_img, expand_px=8)
+    inner = np.array(make_inner_mask(contour_img, inset_px=20))[:, :, 3]
+    keepout = make_design_keepout_mask(design_img, expand_px=14)
 
     material_alpha = cv2.subtract(inner, keepout)
 
@@ -180,7 +171,7 @@ def make_material_preview(contour_img: Image.Image, design_img: Image.Image, mat
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": 11}
+    return {"ok": True, "version": 12}
 
 
 @app.post("/process-sticker")
@@ -204,7 +195,7 @@ async def process_sticker(
             "debug_material": material,
             "debug_texture_found": material_preview is not None,
             "debug_texture_path": texture_path,
-            "debug_version": 11
+            "debug_version": 12
         })
     except Exception as e:
         return JSONResponse(
