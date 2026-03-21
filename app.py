@@ -1,4 +1,4 @@
-# Sticker Wizard - Version 7
+# Sticker Wizard - Version 8
 
 from io import BytesIO
 import base64
@@ -22,7 +22,6 @@ app.add_middleware(
 )
 
 BASE_DIR = Path(__file__).resolve().parent
-TEXTURES_DIR = BASE_DIR / "textures"
 
 
 def to_base64(img: Image.Image) -> str:
@@ -41,7 +40,7 @@ def trim_transparent(img: Image.Image, padding_ratio: float = 0.10) -> Image.Ima
     ys, xs = np.where(alpha > 0)
 
     if len(xs) == 0 or len(ys) == 0:
-        return img
+      return img
 
     x1, x2 = xs.min(), xs.max()
     y1, y2 = ys.min(), ys.max()
@@ -90,70 +89,4 @@ def fill_small_holes(img: Image.Image, max_hole_area: int = 10000) -> Image.Imag
 def make_inner_mask(contour_img: Image.Image, inset_px: int = 18) -> Image.Image:
     arr = np.array(contour_img)
     alpha = arr[:, :, 3]
-    kernel = np.ones((inset_px, inset_px), np.uint8)
-    eroded = cv2.erode(alpha, kernel, iterations=1)
-
-    out = np.zeros((alpha.shape[0], alpha.shape[1], 4), dtype=np.uint8)
-    out[:, :, 0:3] = 255
-    out[:, :, 3] = eroded
-    return Image.fromarray(out, "RGBA")
-
-
-def load_texture(material: str, size: tuple[int, int]) -> Image.Image | None:
-    if material == "holographic":
-        path = TEXTURES_DIR / "holographic.png"
-        if not path.exists():
-            return None
-        tex = Image.open(path).convert("RGBA")
-        return tex.resize(size, Image.Resampling.LANCZOS)
-
-    return None
-
-
-def apply_mask_to_texture(texture: Image.Image, mask_img: Image.Image) -> Image.Image:
-    tex = texture.copy().convert("RGBA")
-    mask_alpha = np.array(mask_img)[:, :, 3]
-    tex_arr = np.array(tex)
-    tex_arr[:, :, 3] = mask_alpha
-    return Image.fromarray(tex_arr, "RGBA")
-
-
-def make_material_preview(contour_img: Image.Image, material: str) -> Image.Image | None:
-    inner_mask = make_inner_mask(contour_img, inset_px=18)
-    texture = load_texture(material, contour_img.size)
-
-    if texture is None:
-        return None
-
-    return apply_mask_to_texture(texture, inner_mask)
-
-
-@app.get("/")
-def root():
-    return {"ok": True}
-
-
-@app.post("/process-sticker")
-async def process_sticker(
-    file: UploadFile = File(...),
-    material: str = Form("vinyl")
-):
-    try:
-        data = await file.read()
-        img = load_rgba_from_bytes(data)
-
-        design = trim_transparent(img, padding_ratio=0.10)
-        contour = fill_small_holes(design, max_hole_area=10000)
-        material_preview = make_material_preview(contour, material)
-
-        return JSONResponse({
-            "ok": True,
-            "design_png": to_base64(design),
-            "contour_png": to_base64(contour),
-            "preview_png": to_base64(material_preview) if material_preview else None
-        })
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"ok": False, "error": str(e)}
-        )
+    kernel = np
