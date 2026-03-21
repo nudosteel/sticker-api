@@ -1,4 +1,4 @@
-# VERSION 10 - FastAPI holographic static texture
+# VERSION 11 - Holographic mask excludes inner design gaps
 
 from io import BytesIO
 import base64
@@ -99,6 +99,37 @@ def make_inner_mask(contour_img: Image.Image, inset_px: int = 18) -> Image.Image
     return Image.fromarray(out, "RGBA")
 
 
+def make_design_keepout_mask(design_img: Image.Image, expand_px: int = 8) -> np.ndarray:
+    """
+    Crea una máscara expandida del diseño negro para que el material
+    no se acerque tanto a los bordes del diseño ni entre en huecos pequeños.
+    """
+    design_alpha = np.array(design_img)[:, :, 3]
+    solid = np.where(design_alpha > 0, 255, 0).astype(np.uint8)
+
+    kernel = np.ones((expand_px, expand_px), np.uint8)
+    dilated = cv2.dilate(solid, kernel, iterations=1)
+
+    return dilated
+
+
+def make_material_mask(contour_img: Image.Image, design_img: Image.Image) -> Image.Image:
+    """
+    Máscara final del material:
+    - parte del inner mask
+    - resta el área del diseño expandido
+    """
+    inner = np.array(make_inner_mask(contour_img, inset_px=18))[:, :, 3]
+    keepout = make_design_keepout_mask(design_img, expand_px=8)
+
+    material_alpha = cv2.subtract(inner, keepout)
+
+    out = np.zeros((inner.shape[0], inner.shape[1], 4), dtype=np.uint8)
+    out[:, :, 0:3] = 255
+    out[:, :, 3] = material_alpha
+    return Image.fromarray(out, "RGBA")
+
+
 def find_texture(filename: str) -> Path | None:
     exact = BASE_DIR / "textures" / filename
     if exact.exists():
@@ -136,20 +167,20 @@ def apply_mask_to_texture(texture: Image.Image, mask_img: Image.Image) -> Image.
     return Image.fromarray(tex_arr, "RGBA")
 
 
-def make_material_preview(contour_img: Image.Image, material: str):
-    inner_mask = make_inner_mask(contour_img, inset_px=18)
+def make_material_preview(contour_img: Image.Image, design_img: Image.Image, material: str):
     texture, texture_path = load_texture(material, contour_img.size)
 
     if texture is None:
         return None, texture_path
 
-    preview = apply_mask_to_texture(texture, inner_mask)
+    material_mask = make_material_mask(contour_img, design_img)
+    preview = apply_mask_to_texture(texture, material_mask)
     return preview, texture_path
 
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": 10}
+    return {"ok": True, "version": 11}
 
 
 @app.post("/process-sticker")
@@ -163,7 +194,7 @@ async def process_sticker(
 
         design = trim_transparent(img, padding_ratio=0.10)
         contour = fill_small_holes(design, max_hole_area=10000)
-        material_preview, texture_path = make_material_preview(contour, material)
+        material_preview, texture_path = make_material_preview(contour, design, material)
 
         return JSONResponse({
             "ok": True,
@@ -172,7 +203,8 @@ async def process_sticker(
             "preview_png": to_base64(material_preview) if material_preview else None,
             "debug_material": material,
             "debug_texture_found": material_preview is not None,
-            "debug_texture_path": texture_path
+            "debug_texture_path": texture_path,
+            "debug_version": 11
         })
     except Exception as e:
         return JSONResponse(
