@@ -1,4 +1,4 @@
-# VERSION 31.2 - Debug masks + transparent debug PNGs
+# VERSION 34 - Final preview with shadow rendered in Python
 
 from io import BytesIO
 import base64
@@ -11,7 +11,7 @@ import numpy as np
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from PIL import Image
+from PIL import Image, ImageFilter
 
 app = FastAPI()
 
@@ -30,14 +30,6 @@ def to_base64(img: Image.Image) -> str:
     buf = BytesIO()
     img.save(buf, format="PNG")
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
-
-
-def mask_to_base64(mask: np.ndarray) -> str:
-    h, w = mask.shape
-    rgba = np.zeros((h, w, 4), dtype=np.uint8)
-    rgba[:, :, 3] = mask
-    img = Image.fromarray(rgba, "RGBA")
-    return to_base64(img)
 
 
 def load_rgba_from_bytes(data: bytes) -> Image.Image:
@@ -97,8 +89,7 @@ def sanitize_design_rgba(design_trimmed: Image.Image) -> Image.Image:
 def build_alpha_mask(design_img: Image.Image) -> np.ndarray:
     arr = np.array(design_img)
     alpha = arr[:, :, 3].astype(np.uint8)
-    mask = np.where(alpha >= 8, 255, 0).astype(np.uint8)
-    return mask
+    return np.where(alpha >= 8, 255, 0).astype(np.uint8)
 
 
 def get_components(mask: np.ndarray, min_area: int = 16):
@@ -218,7 +209,6 @@ def metaball_outline(mask: np.ndarray, border_px: int) -> np.ndarray:
     kernel = make_ellipse_kernel(clean_k)
     smooth = cv2.morphologyEx(smooth, cv2.MORPH_CLOSE, kernel, iterations=1)
     smooth = cv2.morphologyEx(smooth, cv2.MORPH_OPEN, kernel, iterations=1)
-
     return smooth
 
 
@@ -243,7 +233,7 @@ def fill_small_inner_holes(mask: np.ndarray, max_hole_area: int = 4200) -> np.nd
     return solid
 
 
-def make_sticker_mask(alpha_mask: np.ndarray):
+def make_sticker_mask(alpha_mask: np.ndarray) -> np.ndarray:
     h, w = alpha_mask.shape
     max_dim = max(h, w)
 
@@ -266,8 +256,7 @@ def make_sticker_mask(alpha_mask: np.ndarray):
     contours, _ = cv2.findContours(sticker, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     final_mask = np.zeros_like(sticker)
     cv2.drawContours(final_mask, contours, -1, 255, thickness=cv2.FILLED)
-
-    return base, final_mask
+    return final_mask
 
 
 def make_rgba_from_alpha(alpha: np.ndarray, rgb=(255, 255, 255)) -> Image.Image:
@@ -284,9 +273,11 @@ def find_texture(filename: str) -> Path | None:
     exact = BASE_DIR / "textures" / filename
     if exact.exists():
         return exact
+
     railway_path = Path("/app/textures") / filename
     if railway_path.exists():
         return railway_path
+
     for p in BASE_DIR.rglob(filename):
         if p.is_file():
             return p
@@ -313,9 +304,28 @@ def apply_alpha_mask(img: Image.Image, alpha_mask: np.ndarray) -> Image.Image:
     return Image.fromarray(arr, "RGBA")
 
 
+def create_shadow_from_mask(mask: np.ndarray, blur_radius: int = 18, opacity: int = 70, offset=(0, 14)) -> Image.Image:
+    h, w = mask.shape
+    alpha = Image.fromarray(mask, "L")
+    shadow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+
+    shadow_alpha = alpha.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    shadow_rgba = Image.new("RGBA", (w, h), (0, 0, 0, opacity))
+    shadow_rgba.putalpha(shadow_alpha)
+
+    base = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    base.alpha_composite(shadow_rgba, dest=offset)
+    return base
+
+
 def compose_final_preview(design_img: Image.Image, sticker_alpha: np.ndarray, material: str):
     texture_path = None
-    canvas = Image.new("RGBA", design_img.size, (0, 0, 0, 0))
+    w, h = design_img.size
+
+    canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+
+    shadow = create_shadow_from_mask(sticker_alpha, blur_radius=18, opacity=70, offset=(0, 14))
+    canvas.alpha_composite(shadow)
 
     if material == "holographic":
         texture, texture_path = load_texture(material, design_img.size)
@@ -333,7 +343,7 @@ def compose_final_preview(design_img: Image.Image, sticker_alpha: np.ndarray, ma
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": "31.2"}
+    return {"ok": True, "version": "34"}
 
 
 @app.post("/process-sticker")
@@ -345,19 +355,16 @@ async def process_sticker(file: UploadFile = File(...), material: str = Form("vi
 
         clean_design = sanitize_design_rgba(design_trimmed)
         alpha_mask = build_alpha_mask(clean_design)
-        base_mask, sticker_alpha = make_sticker_mask(alpha_mask)
+        sticker_alpha = make_sticker_mask(alpha_mask)
 
         final_preview, texture_path = compose_final_preview(clean_design, sticker_alpha, material)
 
         return JSONResponse({
             "ok": True,
             "final_preview_png": to_base64(final_preview),
-            "debug_alpha_mask_png": mask_to_base64(alpha_mask),
-            "debug_base_mask_png": mask_to_base64(base_mask),
-            "debug_sticker_mask_png": mask_to_base64(sticker_alpha),
+            "debug_version": "34",
             "debug_texture_found": texture_path is not None,
-            "debug_texture_path": texture_path,
-            "debug_version": "31.2"
+            "debug_texture_path": texture_path
         })
     except Exception as e:
         return JSONResponse(
