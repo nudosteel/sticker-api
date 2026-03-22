@@ -50,7 +50,7 @@ CACHE_TTL_SECONDS = 600         # 10 min
 CACHE_MAX_ENTRIES = 50
 
 VALID_FORMATS = {"image/png", "image/jpeg", "image/webp", "image/tiff", "image/bmp"}
-VALID_MATERIALS = {"vinyl", "matte", "clear", "holographic", "kraft", "glitter"}
+VALID_MATERIALS = {"vinyl", "matte", "clear", "holographic", "kraft", "glitter", "mirror"}
 
 # ─────────────────────────────────────────────
 # CACHE (thread-safe, LRU + TTL)
@@ -514,6 +514,7 @@ TEXTURE_MAP = {
     "holographic": "holographic.png",
     "glitter":     "glitter.png",
     "kraft":       "kraft.png",
+    "mirror":      "mirror.png",
 }
 
 MATERIAL_BASE_COLOR = {
@@ -523,6 +524,7 @@ MATERIAL_BASE_COLOR = {
     "holographic": (255, 255, 255),
     "kraft":       (194, 164, 120),
     "glitter":     (255, 255, 255),
+    "mirror":      (220, 220, 230),
 }
 
 
