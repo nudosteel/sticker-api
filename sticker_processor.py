@@ -1,4 +1,4 @@
-# VERSION 36.0 - Geometric shapes fully fixed
+# VERSION 36.1 - Geometric shapes + Any-color background removal
 # Changes from v35.x:
 #   - NEW: apply_geometric_shape() — single function handles everything:
 #     1. Pads canvas to SQUARE so circles never get clipped on wide/tall designs
@@ -220,7 +220,79 @@ def build_alpha_mask(img: Image.Image) -> np.ndarray:
 # ─────────────────────────────────────────────
 # BACKGROUND REMOVAL
 # ─────────────────────────────────────────────
+def detect_background_color(img_rgb: np.ndarray) -> tuple[np.ndarray, bool]:
+    """
+    Detects the dominant background color by sampling the image borders.
+    Returns (bg_color_rgb, is_solid_bg).
+    """
+    h, w = img_rgb.shape[:2]
+    border_px = max(5, min(h, w) // 15)
+
+    # sample pixels from all 4 edges
+    top = img_rgb[:border_px, :].reshape(-1, 3)
+    bottom = img_rgb[h - border_px:, :].reshape(-1, 3)
+    left = img_rgb[:, :border_px].reshape(-1, 3)
+    right = img_rgb[:, w - border_px:].reshape(-1, 3)
+    border_pixels = np.vstack([top, bottom, left, right])
+
+    # compute median color of border
+    median_color = np.median(border_pixels, axis=0).astype(np.uint8)
+
+    # check how consistent the border color is (low std = solid bg)
+    diffs = np.abs(border_pixels.astype(np.float32) - median_color.astype(np.float32))
+    mean_diff = np.mean(diffs)
+
+    # if border pixels are very consistent (mean diff < 30), it's a solid bg
+    is_solid = mean_diff < 30
+
+    return median_color, is_solid
+
+
+def remove_solid_background(img: Image.Image, bg_color: np.ndarray, tolerance: int = 40) -> Image.Image:
+    """
+    Removes pixels that are close to bg_color. Works for any solid background color.
+    """
+    rgba = img.convert("RGBA")
+    arr = np.array(rgba)
+    rgb = arr[:, :, :3].astype(np.float32)
+    bg = bg_color.astype(np.float32)
+
+    # color distance from background
+    diff = np.sqrt(np.sum((rgb - bg) ** 2, axis=2))
+
+    # foreground = pixels far from bg color
+    # soft edge: ramp from 0 to 255 between tolerance*0.6 and tolerance*1.2
+    inner = tolerance * 0.6
+    outer = tolerance * 1.2
+    alpha_f = np.clip((diff - inner) / max(1, outer - inner), 0, 1)
+    fg_alpha = (alpha_f * 255).astype(np.uint8)
+
+    # morphological cleanup
+    fg_binary = (fg_alpha > 30).astype(np.uint8) * 255
+    fg_binary = cv2.morphologyEx(fg_binary, cv2.MORPH_OPEN, make_ellipse_kernel(3), iterations=1)
+    fg_binary = cv2.morphologyEx(fg_binary, cv2.MORPH_CLOSE, make_ellipse_kernel(7), iterations=2)
+
+    # remove tiny noise components
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(fg_binary, 8)
+    h, w = fg_binary.shape
+    min_area = max(40, int((h * w) * 0.0005))
+    clean = np.zeros_like(fg_binary)
+    for i in range(1, num):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            clean[labels == i] = 255
+
+    # blend: use clean mask but preserve soft edges from color distance
+    alpha_final = np.minimum(fg_alpha, clean)
+    alpha_final = cv2.GaussianBlur(alpha_final.astype(np.float32), (0, 0), sigmaX=1.2, sigmaY=1.2)
+    alpha_final = np.clip(alpha_final, 0, 255).astype(np.uint8)
+
+    out = arr.copy()
+    out[:, :, 3] = alpha_final
+    return Image.fromarray(out, "RGBA")
+
+
 def extract_logo_from_light_background(img: Image.Image) -> Image.Image:
+    """Legacy: removes white/very light backgrounds."""
     rgba = img.convert("RGBA")
     arr = np.array(rgba)
     rgb = arr[:, :, :3]
@@ -247,13 +319,30 @@ def extract_logo_from_light_background(img: Image.Image) -> Image.Image:
 
 def prepare_input_image(img: Image.Image) -> tuple[Image.Image, str]:
     img = img.convert("RGBA")
+
+    # 1. if image already has alpha transparency, use it as-is
     if has_useful_alpha(img):
         return img, "alpha"
+
+    # 2. detect background color from image borders
+    rgb = np.array(img)[:, :, :3]
+    bg_color, is_solid = detect_background_color(rgb)
+
+    # 3. if solid background detected, remove it (works for ANY color)
+    if is_solid:
+        removed = remove_solid_background(img, bg_color, tolerance=40)
+        rm_alpha = np.array(removed)[:, :, 3]
+        coverage = float(np.count_nonzero(rm_alpha)) / float(rm_alpha.size)
+        if 0.001 < coverage < 0.85:
+            return removed, "solid_bg"
+
+    # 4. fallback: try white/light background removal
     light_bg = extract_logo_from_light_background(img)
     light_alpha = np.array(light_bg)[:, :, 3]
     coverage = float(np.count_nonzero(light_alpha)) / float(light_alpha.size)
     if 0.001 < coverage < 0.55:
         return light_bg, "light_bg"
+
     return img, "none"
 
 
@@ -790,7 +879,7 @@ def run_heavy_pipeline(
 # ─────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"ok": True, "version": "36.0"}
+    return {"ok": True, "version": "36.1"}
 
 
 @app.get("/cache-stats")
@@ -836,7 +925,7 @@ async def process_sticker(
             "border_ratio": border_ratio,
             "material": material,
             "shape": shape,
-            "debug_version": "36.0",
+            "debug_version": "36.1",
             "debug_cache_hit": heavy["cache_hit"],
             "debug_texture_found": texture_path is not None,
             "debug_bg_method": heavy["bg_method"],
@@ -885,7 +974,7 @@ async def recompose(
             "border_ratio": border_ratio,
             "material": material,
             "shape": shape,
-            "debug_version": "36.0",
+            "debug_version": "36.1",
             "debug_cache_hit": True,
             "debug_texture_found": texture_path is not None,
         })
@@ -952,7 +1041,7 @@ async def save_design(
         }
         save_design_to_disk(token, data, meta)
 
-        return JSONResponse({"ok": True, "order_token": token, "debug_version": "36.0"})
+        return JSONResponse({"ok": True, "order_token": token, "debug_version": "36.1"})
     except HTTPException:
         raise
     except Exception as e:
