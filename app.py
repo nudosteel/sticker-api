@@ -1,12 +1,11 @@
-# VERSION CLAUDE 35.0 - Cached & Optimized
-# Changes from v34.6:
-#   - In-memory LRU cache: mask computation is cached per image hash
-#   - New /recompose endpoint: change material/border instantly without reprocessing
-#   - Input validation: file size limits, format checks, dimension caps
-#   - Preview downscaling: generates fast previews for large images
-#   - Separated heavy pipeline (mask) from light pipeline (composition)
-#   - Added configurable border thickness via API parameter
-#   - TTL-based cache expiration to prevent memory leaks
+# VERSION 35.1 - Improved Borders (StickerApp-quality)
+# Changes from v35.0:
+#   - Tighter border: default ratio 0.05 → 0.028, matching StickerApp look
+#   - Reduced canvas padding: 0.14 → 0.08, less wasted white space
+#   - New smooth_contour_spline(): cubic spline interpolation for organic edges
+#   - Reworked metaball_outline: smaller blur kernel, tighter distance threshold
+#   - Tighter cluster merging for text-like designs
+#   - All cache/validation/recompose features from v35.0 preserved
 
 from io import BytesIO
 import base64
@@ -20,6 +19,11 @@ from typing import Optional
 
 import cv2
 import numpy as np
+try:
+    from scipy.interpolate import splprep, splev
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -133,7 +137,7 @@ def trim_transparent(img: Image.Image, padding_ratio: float = 0.08) -> Image.Ima
     return Image.fromarray(arr[top:bottom, left:right], "RGBA")
 
 
-def add_canvas_padding(img: Image.Image, padding_ratio: float = 0.14, min_px: int = 70) -> Image.Image:
+def add_canvas_padding(img: Image.Image, padding_ratio: float = 0.08, min_px: int = 40) -> Image.Image:
     w, h = img.size
     pad = max(min_px, int(max(w, h) * padding_ratio))
     canvas = Image.new("RGBA", (w + pad * 2, h + pad * 2), (0, 0, 0, 0))
@@ -308,6 +312,10 @@ def cluster_mask_from_labels(labels: np.ndarray, cluster) -> np.ndarray:
 
 
 def merge_cluster_shape(cluster_mask: np.ndarray, max_dim: int) -> np.ndarray:
+    """
+    v35.1: Tighter kernels for merging nearby components.
+    This prevents excessive white fill between letters like B-U-S-I-N-E-S-S.
+    """
     num, labels, stats, _ = cv2.connectedComponentsWithStats(cluster_mask, 8)
     if num <= 2:
         return cluster_mask
@@ -320,26 +328,88 @@ def merge_cluster_shape(cluster_mask: np.ndarray, max_dim: int) -> np.ndarray:
         comps.append((x, y, w, h))
     total_w = max(x + w for x, y, w, h in comps) - min(x for x, y, w, h in comps)
     total_h = max(y + h for x, y, w, h in comps) - min(y for x, y, w, h in comps)
+    # smaller kernels → components merge but don't inflate
     if total_w >= total_h * 1.4:
-        kernel = make_ellipse_kernel(max(5, int(max_dim * 0.012)), max(3, int(max_dim * 0.006)))
+        kernel = make_ellipse_kernel(max(3, int(max_dim * 0.008)), max(3, int(max_dim * 0.004)))
     else:
-        kernel = make_ellipse_kernel(max(5, int(max_dim * 0.010)), max(7, int(max_dim * 0.016)))
+        kernel = make_ellipse_kernel(max(3, int(max_dim * 0.006)), max(3, int(max_dim * 0.010)))
     return cv2.morphologyEx(cluster_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
 
 
+def chaikin_smooth(pts: np.ndarray, iterations: int = 3) -> np.ndarray:
+    """
+    Chaikin's corner cutting algorithm — pure numpy, no scipy needed.
+    Each iteration replaces each segment with two points at 25%/75%,
+    progressively rounding corners into smooth curves.
+    Works beautifully for sticker outlines.
+    """
+    for _ in range(iterations):
+        n = len(pts)
+        if n < 3:
+            return pts
+        q = np.empty((n * 2, 2), dtype=pts.dtype)
+        for i in range(n):
+            p0 = pts[i]
+            p1 = pts[(i + 1) % n]
+            q[2 * i] = 0.75 * p0 + 0.25 * p1
+            q[2 * i + 1] = 0.25 * p0 + 0.75 * p1
+        pts = q
+    return pts
+
+
+def smooth_contour_spline(contour: np.ndarray, num_points: int = 300, smoothing: float = 0.0) -> np.ndarray:
+    """
+    Takes a raw OpenCV contour and returns a smoothed version.
+    Uses scipy cubic splines if available, otherwise falls back to
+    Chaikin's corner cutting (pure numpy, same visual quality).
+    """
+    pts = contour.reshape(-1, 2).astype(np.float64)
+    if len(pts) < 6:
+        return contour
+
+    # --- Method 1: scipy cubic spline (best quality) ---
+    if HAS_SCIPY:
+        try:
+            pts_closed = np.vstack([pts, pts[0:1]])
+            x, y = pts_closed[:, 0], pts_closed[:, 1]
+            tck, u = splprep([x, y], s=smoothing, per=True, k=3)
+            u_new = np.linspace(0, 1, num_points)
+            sx, sy = splev(u_new, tck)
+            smooth_pts = np.column_stack([sx, sy]).astype(np.int32)
+            return smooth_pts.reshape(-1, 1, 2)
+        except (ValueError, TypeError):
+            pass  # fall through to Chaikin
+
+    # --- Method 2: Chaikin corner cutting (no dependencies) ---
+    # 4 iterations ≈ cubic spline quality for sticker outlines
+    smooth_pts = chaikin_smooth(pts, iterations=4).astype(np.int32)
+    return smooth_pts.reshape(-1, 1, 2)
+
+
 def metaball_outline(mask: np.ndarray, border_px: int) -> np.ndarray:
+    """
+    v35.1: Tighter outline generation.
+    - Smaller blur kernel (0.3x border instead of 0.55x) → hugs the design closer
+    - Lower threshold (110 instead of 127) → less rounding at concavities
+    - Minimal morphology cleanup to avoid inflating the shape
+    """
     inv = 255 - mask
     dist = cv2.distanceTransform(inv, cv2.DIST_L2, 5)
     expanded = np.where(dist <= border_px, 255, 0).astype(np.uint8)
-    blur = max(5, int(border_px * 0.55))
+
+    # SMALLER blur → tighter to the original shape
+    blur = max(3, int(border_px * 0.30))
     if blur % 2 == 0:
         blur += 1
     blurred = cv2.GaussianBlur(expanded, (blur, blur), 0)
-    _, smooth = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
-    clean_k = max(3, int(border_px * 0.18))
+
+    # lower threshold → preserves concavities (between letters, etc.)
+    _, smooth = cv2.threshold(blurred, 110, 255, cv2.THRESH_BINARY)
+
+    # minimal cleanup — just close tiny gaps, don't inflate
+    clean_k = max(3, int(border_px * 0.12))
     kernel = make_ellipse_kernel(clean_k)
     smooth = cv2.morphologyEx(smooth, cv2.MORPH_CLOSE, kernel, iterations=1)
-    smooth = cv2.morphologyEx(smooth, cv2.MORPH_OPEN, kernel, iterations=1)
     return smooth
 
 
@@ -361,11 +431,14 @@ def fill_small_inner_holes(mask: np.ndarray, max_hole_area: int = 4200) -> np.nd
     return solid
 
 
-def make_sticker_mask(alpha_mask: np.ndarray, border_ratio: float = 0.05) -> np.ndarray:
-    """Now accepts configurable border_ratio (default 0.05 = 5% of max dimension)."""
+def make_sticker_mask(alpha_mask: np.ndarray, border_ratio: float = 0.028) -> np.ndarray:
+    """
+    v35.1: default border_ratio lowered to 0.028 (was 0.05).
+    Now applies cubic spline smoothing to contours for organic StickerApp-quality edges.
+    """
     h, w = alpha_mask.shape
     max_dim = max(h, w)
-    comps, labels = get_components(alpha_mask, min_area=max(12, int(max_dim * 0.001)))
+    comps, labels = get_components(alpha_mask, min_area=max(16, int(max_dim * 0.001)))
     clusters = cluster_components(comps, max_dim)
     if not clusters:
         base = alpha_mask.copy()
@@ -375,12 +448,30 @@ def make_sticker_mask(alpha_mask: np.ndarray, border_ratio: float = 0.05) -> np.
             cluster_mask = cluster_mask_from_labels(labels, cluster)
             cluster_mask = merge_cluster_shape(cluster_mask, max_dim)
             base = cv2.bitwise_or(base, cluster_mask)
-    border_px = max(16, int(max_dim * border_ratio))
+
+    border_px = max(10, int(max_dim * border_ratio))
     sticker = metaball_outline(base, border_px)
     sticker = fill_small_inner_holes(sticker, max_hole_area=4200)
+
+    # extract contours and smooth them with cubic splines
     contours, _ = cv2.findContours(sticker, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
     final_mask = np.zeros_like(sticker)
-    cv2.drawContours(final_mask, contours, -1, 255, thickness=cv2.FILLED)
+    for cnt in contours:
+        if len(cnt) < 6:
+            cv2.drawContours(final_mask, [cnt], -1, 255, thickness=cv2.FILLED)
+            continue
+
+        # spline points proportional to contour length for consistent detail
+        perimeter = cv2.arcLength(cnt, closed=True)
+        num_pts = max(100, min(800, int(perimeter * 0.4)))
+
+        # smoothing factor scales with border size — bigger border, slightly more relaxation
+        spline_s = float(border_px) * 1.5
+
+        smooth_cnt = smooth_contour_spline(cnt, num_points=num_pts, smoothing=spline_s)
+        cv2.drawContours(final_mask, [smooth_cnt], -1, 255, thickness=cv2.FILLED)
+
     return final_mask
 
 
@@ -527,7 +618,7 @@ def downscale_for_preview(img: Image.Image, max_dim: int = PREVIEW_MAX_DIM) -> t
 # ─────────────────────────────────────────────
 def run_heavy_pipeline(
     raw_data: bytes,
-    border_ratio: float = 0.05,
+    border_ratio: float = 0.028,
     for_preview: bool = True,
 ) -> dict:
     """
@@ -555,7 +646,7 @@ def run_heavy_pipeline(
 
     clean_design = sanitize_design_rgba(design_trimmed, material="vinyl")  # initial sanitize
     clean_design = antialias_rgba_edges(clean_design, sigma=0.9)
-    padded_design = add_canvas_padding(clean_design, padding_ratio=0.14, min_px=70)
+    padded_design = add_canvas_padding(clean_design, padding_ratio=0.08, min_px=40)
 
     alpha_mask = build_alpha_mask(padded_design)
     sticker_alpha = make_sticker_mask(alpha_mask, border_ratio=border_ratio)
@@ -578,7 +669,7 @@ def run_heavy_pipeline(
 # ─────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"ok": True, "version": "35.0"}
+    return {"ok": True, "version": "35.1"}
 
 
 @app.get("/cache-stats")
@@ -591,7 +682,7 @@ def cache_stats():
 async def process_sticker(
     file: UploadFile = File(...),
     material: str = Form("vinyl"),
-    border_ratio: float = Form(0.05),
+    border_ratio: float = Form(0.028),
 ):
     """
     Full pipeline: upload → mask (cached) → compose.
@@ -623,7 +714,7 @@ async def process_sticker(
             "cache_key": heavy["fhash"],
             "border_ratio": border_ratio,
             "material": material,
-            "debug_version": "35.0",
+            "debug_version": "35.1",
             "debug_cache_hit": heavy["cache_hit"],
             "debug_texture_found": texture_path is not None,
             "debug_bg_method": heavy["bg_method"],
@@ -641,7 +732,7 @@ async def process_sticker(
 async def recompose(
     cache_key: str = Form(...),
     material: str = Form("vinyl"),
-    border_ratio: float = Form(0.05),
+    border_ratio: float = Form(0.028),
 ):
     """
     FAST endpoint: recomposes from cached mask.
@@ -672,7 +763,7 @@ async def recompose(
             "cache_key": cache_key,
             "border_ratio": border_ratio,
             "material": material,
-            "debug_version": "35.0",
+            "debug_version": "35.1",
             "debug_cache_hit": True,
             "debug_texture_found": texture_path is not None,
         })
