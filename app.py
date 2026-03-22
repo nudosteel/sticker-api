@@ -105,7 +105,7 @@ def simplify_external_contours(mask: np.ndarray) -> np.ndarray:
 
     for cnt in contours:
         peri = cv2.arcLength(cnt, True)
-        epsilon = max(1.5, 0.006 * peri)
+        epsilon = max(2.5, 0.008 * peri)
         approx = cv2.approxPolyDP(cnt, epsilon, True)
         cv2.drawContours(out, [approx], -1, 255, thickness=cv2.FILLED)
 
@@ -122,7 +122,7 @@ def make_sticker_mask(design_alpha: np.ndarray) -> np.ndarray:
     """
     h, w = design_alpha.shape
 
-    border_px = max(18, int(max(h, w) * 0.06))
+    border_px = max(21, int(max(h, w) * 0.065))
 
     dilate_kernel = make_ellipse_kernel(border_px)
     dilated = cv2.dilate(design_alpha, dilate_kernel, iterations=1)
