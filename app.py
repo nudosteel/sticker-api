@@ -1,4 +1,4 @@
-# VERSION 34.1 - Add internal canvas padding so preview doesn't clip
+# VERSION 34.2 - Final preview with shadow rendered in Python + thinner border
 
 from io import BytesIO
 import base64
@@ -259,7 +259,7 @@ def make_sticker_mask(alpha_mask: np.ndarray) -> np.ndarray:
             cluster_mask = merge_cluster_shape(cluster_mask, max_dim)
             base = cv2.bitwise_or(base, cluster_mask)
 
-    border_px = max(14, int(max_dim * 0.06))
+    border_px = max(16, int(max_dim * 0.05))
     sticker = metaball_outline(base, border_px)
     sticker = fill_small_inner_holes(sticker, max_hole_area=4200)
 
@@ -352,7 +352,7 @@ def compose_final_preview(design_img: Image.Image, sticker_alpha: np.ndarray, ma
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": "34.1"}
+    return {"ok": True, "version": "34.2"}
 
 
 @app.post("/process-sticker")
@@ -363,8 +363,6 @@ async def process_sticker(file: UploadFile = File(...), material: str = Form("vi
 
         design_trimmed = trim_transparent(raw_img, padding_ratio=0.08)
         clean_design = sanitize_design_rgba(design_trimmed)
-
-        # ESTE ES EL CAMBIO IMPORTANTE
         padded_design = add_canvas_padding(clean_design, padding_ratio=0.14, min_px=70)
 
         alpha_mask = build_alpha_mask(padded_design)
@@ -375,7 +373,7 @@ async def process_sticker(file: UploadFile = File(...), material: str = Form("vi
         return JSONResponse({
             "ok": True,
             "final_preview_png": to_base64(final_preview),
-            "debug_version": "34.1",
+            "debug_version": "34.2",
             "debug_texture_found": texture_path is not None,
             "debug_texture_path": texture_path
         })
