@@ -1,4 +1,4 @@
-# VERSION gemini 30 - Perfect Circular Offset using Euclidean Distance Transform
+# VERSION 31 - True Mathematical Circular Offset (DIST_MASK_PRECISE)
 
 from io import BytesIO
 import base64
@@ -194,14 +194,14 @@ def merge_cluster_mask(labels: np.ndarray, cluster) -> np.ndarray:
 
 def exact_circular_dilate(mask: np.ndarray, radius: float) -> np.ndarray:
     """
-    Expansión MATEMÁTICA perfecta. Usa la distancia euclidiana en lugar 
-    de un kernel de píxeles, garantizando curvas 100% circulares.
+    Expansión MATEMÁTICA perfecta.
+    El uso de cv2.DIST_MASK_PRECISE obliga a calcular el círculo exacto
+    sin aproximaciones poligonales rápidas.
     """
     if radius <= 0:
         return mask
     inv = 255 - mask
-    # cv2.DIST_L2 es la distancia Euclidiana perfecta
-    dist = cv2.distanceTransform(inv, cv2.DIST_L2, 5)
+    dist = cv2.distanceTransform(inv, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
     return np.where(dist <= radius, 255, 0).astype(np.uint8)
 
 
@@ -245,15 +245,15 @@ def make_cutline_base(alpha_mask: np.ndarray) -> np.ndarray:
         cluster_mask = merge_cluster_mask(labels, cluster)
 
         if bridge_radius > 0:
-            # 1. Expandir circularmente
             expanded = exact_circular_dilate(cluster_mask, bridge_radius)
-            # 2. Encoger circularmente (Closing perfecto sin usar kernels)
-            dist_in = cv2.distanceTransform(expanded, cv2.DIST_L2, 5)
+            # Aquí también forzamos la precisión absoluta
+            dist_in = cv2.distanceTransform(expanded, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
             closed = np.where(dist_in > bridge_radius, 255, 0).astype(np.uint8)
         else:
             closed = cluster_mask
 
-        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # CHAIN_APPROX_NONE para no perder resolución en las curvas
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         cv2.drawContours(base, contours, -1, 255, thickness=cv2.FILLED)
 
     return base
@@ -265,13 +265,13 @@ def make_sticker_mask(alpha_mask: np.ndarray) -> np.ndarray:
 
     cutline_base = make_cutline_base(alpha_mask)
 
-    # Grosor del borde
+    # Grosor del borde de corte
     border_px = max(18, int(max_dim * 0.06))
     
-    # Aquí está el truco: dilatamos usando distancia matemática pura
+    # Dilatación matemática estricta
     dilated = exact_circular_dilate(cutline_base, border_px)
 
-    # Suavizado final ligero para asegurar transiciones sin dientes de sierra
+    # Suavizado final ligero (anti-aliasing)
     blur_size = max(5, int(border_px * 0.2))
     if blur_size % 2 == 0:
         blur_size += 1
@@ -281,7 +281,8 @@ def make_sticker_mask(alpha_mask: np.ndarray) -> np.ndarray:
 
     shaped = fill_small_inner_holes(shaped, max_hole_area=6000)
 
-    contours, _ = cv2.findContours(shaped, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # CHAIN_APPROX_NONE evita que opencv convierta las curvas suaves en polígonos
+    contours, _ = cv2.findContours(shaped, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     final_mask = np.zeros_like(shaped)
     cv2.drawContours(final_mask, contours, -1, 255, thickness=cv2.FILLED)
 
@@ -356,7 +357,7 @@ def compose_final_preview(design_img: Image.Image, sticker_alpha: np.ndarray, ma
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": 30}
+    return {"ok": True, "version": 31}
 
 
 @app.post("/process-sticker")
@@ -384,7 +385,7 @@ async def process_sticker(
             "debug_material": material,
             "debug_texture_found": texture_path is not None,
             "debug_texture_path": texture_path,
-            "debug_version": 30
+            "debug_version": 31
         })
     except Exception as e:
         return JSONResponse(
