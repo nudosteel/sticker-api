@@ -335,7 +335,7 @@ def apply_alpha_mask(img: Image.Image, alpha_mask: np.ndarray) -> Image.Image:
     return Image.fromarray(arr, "RGBA")
 
 
-def create_shadow_from_mask(mask: np.ndarray, blur_radius: int = 18, opacity: int = 70, offset=(0, 14)) -> Image.Image:
+def create_shadow_from_mask(mask: np.ndarray, blur_radius: int = 14, opacity: int = 30, offset=(0, 14)) -> Image.Image:
     h, w = mask.shape
     alpha = Image.fromarray(mask, "L")
 
