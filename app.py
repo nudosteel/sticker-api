@@ -1,4 +1,4 @@
-# VERSION 17 - Thicker white contour like StickerApp
+# VERSION 18 - Fill only tiny inner holes safely
 
 from io import BytesIO
 import base64
@@ -82,25 +82,49 @@ def clean_design_alpha(design_img: Image.Image, max_hole_area: int = 10000) -> n
     return solid
 
 
+def fill_small_inner_holes(mask: np.ndarray, max_hole_area: int = 1800) -> np.ndarray:
+    """
+    Rellena solo huecos internos pequeños de la máscara del sticker.
+    Los huecos conectados al borde se conservan.
+    """
+    solid = mask.copy()
+    inv = 255 - solid
+
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(inv, 8)
+
+    h, w = solid.shape
+    border = set()
+    border.update(np.unique(labels[0, :]).tolist())
+    border.update(np.unique(labels[h - 1, :]).tolist())
+    border.update(np.unique(labels[:, 0]).tolist())
+    border.update(np.unique(labels[:, w - 1]).tolist())
+
+    for i in range(1, num):
+        if i in border:
+            continue
+        if stats[i, cv2.CC_STAT_AREA] <= max_hole_area:
+            solid[labels == i] = 255
+
+    return solid
+
+
 def make_sticker_mask(design_alpha: np.ndarray) -> np.ndarray:
     """
     Crea el borde real del sticker dilatando el diseño.
-    VERSION 17: más grueso.
+    VERSION 18: mismo grosor que estaba bien, más limpieza de microhuecos.
     """
     h, w = design_alpha.shape
 
-    # Antes:
-    # border_px = max(10, int(max(h, w) * 0.035))
-
-    # Ahora más grueso para acercarse a StickerApp
-    border_px = max(25, int(max(h, w) * 0.095))
-
+    border_px = max(16, int(max(h, w) * 0.055))
     if border_px % 2 != 0:
         border_px += 1
 
     kernel = np.ones((border_px, border_px), np.uint8)
     dilated = cv2.dilate(design_alpha, kernel, iterations=1)
-    return dilated
+
+    # Rellenar solo micro-huecos accidentales
+    cleaned = fill_small_inner_holes(dilated, max_hole_area=1800)
+    return cleaned
 
 
 def make_rgba_from_alpha(alpha: np.ndarray, rgb=(255, 255, 255)) -> Image.Image:
@@ -171,7 +195,7 @@ def compose_final_preview(design_img: Image.Image, sticker_alpha: np.ndarray, ma
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": 17}
+    return {"ok": True, "version": 18}
 
 
 @app.post("/process-sticker")
@@ -201,7 +225,7 @@ async def process_sticker(
             "debug_material": material,
             "debug_texture_found": texture_path is not None,
             "debug_texture_path": texture_path,
-            "debug_version": 17
+            "debug_version": 18
         })
     except Exception as e:
         return JSONResponse(
