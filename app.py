@@ -107,7 +107,7 @@ def make_sticker_mask(design_alpha: np.ndarray) -> np.ndarray:
     """
     h, w = design_alpha.shape
 
-    border_px = max(18, int(max(h, w) * 0.06))
+    border_px = max(20, int(max(h, w) * 0.065))
 
     dilate_kernel = make_ellipse_kernel(border_px)
     dilated = cv2.dilate(design_alpha, dilate_kernel, iterations=1)
