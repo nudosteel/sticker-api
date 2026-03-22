@@ -1,4 +1,4 @@
-# VERSION 18 - Fill only tiny inner holes safely
+# VERSION 19 - Stronger inner-hole fix without breaking contour
 
 from io import BytesIO
 import base64
@@ -82,10 +82,10 @@ def clean_design_alpha(design_img: Image.Image, max_hole_area: int = 10000) -> n
     return solid
 
 
-def fill_small_inner_holes(mask: np.ndarray, max_hole_area: int = 2500) -> np.ndarray:
+def fill_small_inner_holes(mask: np.ndarray, max_hole_area: int = 4200) -> np.ndarray:
     """
     Rellena solo huecos internos pequeños de la máscara del sticker.
-    Los huecos conectados al borde se conservan.
+    Los huecos conectados al borde exterior se conservan.
     """
     solid = mask.copy()
     inv = 255 - solid
@@ -111,7 +111,7 @@ def fill_small_inner_holes(mask: np.ndarray, max_hole_area: int = 2500) -> np.nd
 def make_sticker_mask(design_alpha: np.ndarray) -> np.ndarray:
     """
     Crea el borde real del sticker dilatando el diseño.
-    VERSION 18: mismo grosor que estaba bien, más limpieza de microhuecos.
+    VERSION 19: mismo grosor + cierre suave + relleno de huecos internos.
     """
     h, w = design_alpha.shape
 
@@ -122,8 +122,12 @@ def make_sticker_mask(design_alpha: np.ndarray) -> np.ndarray:
     kernel = np.ones((border_px, border_px), np.uint8)
     dilated = cv2.dilate(design_alpha, kernel, iterations=1)
 
-    # Rellenar solo micro-huecos accidentales
-    cleaned = fill_small_inner_holes(dilated, max_hole_area=1800)
+    # Cierre suave para unir micro-cortes o cortes internos accidentales
+    close_kernel = np.ones((6, 6), np.uint8)
+    closed = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+
+    # Rellenar solo huecos internos pequeños
+    cleaned = fill_small_inner_holes(closed, max_hole_area=4200)
     return cleaned
 
 
@@ -189,13 +193,14 @@ def compose_final_preview(design_img: Image.Image, sticker_alpha: np.ndarray, ma
         white_base = make_rgba_from_alpha(sticker_alpha, (255, 255, 255))
         canvas.alpha_composite(white_base)
 
+    # Diseño negro arriba
     canvas.alpha_composite(design_img)
     return canvas, texture_path
 
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": 18}
+    return {"ok": True, "version": 19}
 
 
 @app.post("/process-sticker")
@@ -225,7 +230,7 @@ async def process_sticker(
             "debug_material": material,
             "debug_texture_found": texture_path is not None,
             "debug_texture_path": texture_path,
-            "debug_version": 18
+            "debug_version": 19
         })
     except Exception as e:
         return JSONResponse(
