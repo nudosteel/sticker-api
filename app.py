@@ -1,4 +1,4 @@
-# VERSION 15 - Holographic as full sticker material
+# VERSION 16 - Real sticker contour + holographic full base
 
 from io import BytesIO
 import base64
@@ -34,7 +34,7 @@ def load_rgba_from_bytes(data: bytes) -> Image.Image:
     return Image.open(BytesIO(data)).convert("RGBA")
 
 
-def trim_transparent(img: Image.Image, padding_ratio: float = 0.10) -> Image.Image:
+def trim_transparent(img: Image.Image, padding_ratio: float = 0.08) -> Image.Image:
     arr = np.array(img)
     alpha = arr[:, :, 3]
     ys, xs = np.where(alpha > 0)
@@ -58,13 +58,12 @@ def trim_transparent(img: Image.Image, padding_ratio: float = 0.10) -> Image.Ima
     return Image.fromarray(cropped, "RGBA")
 
 
-def fill_small_holes(img: Image.Image, max_hole_area: int = 10000) -> Image.Image:
-    arr = np.array(img)
+def clean_design_alpha(design_img: Image.Image, max_hole_area: int = 10000) -> np.ndarray:
+    arr = np.array(design_img)
     alpha = arr[:, :, 3]
-
     solid = np.where(alpha > 0, 255, 0).astype(np.uint8)
-    inv = 255 - solid
 
+    inv = 255 - solid
     num, labels, stats, _ = cv2.connectedComponentsWithStats(inv, 8)
 
     h, w = solid.shape
@@ -80,9 +79,38 @@ def fill_small_holes(img: Image.Image, max_hole_area: int = 10000) -> Image.Imag
         if stats[i, cv2.CC_STAT_AREA] <= max_hole_area:
             solid[labels == i] = 255
 
+    return solid
+
+
+def make_design_rgba_from_alpha(alpha: np.ndarray) -> Image.Image:
+    h, w = alpha.shape
     out = np.zeros((h, w, 4), dtype=np.uint8)
     out[:, :, 0:3] = 255
-    out[:, :, 3] = solid
+    out[:, :, 3] = alpha
+    return Image.fromarray(out, "RGBA")
+
+
+def make_sticker_mask(design_alpha: np.ndarray) -> np.ndarray:
+    """
+    Crea el borde real del sticker dilatando el diseño.
+    """
+    h, w = design_alpha.shape
+    border_px = max(10, int(max(h, w) * 0.035))
+    if border_px % 2 != 0:
+        border_px += 1
+
+    kernel = np.ones((border_px, border_px), np.uint8)
+    dilated = cv2.dilate(design_alpha, kernel, iterations=1)
+    return dilated
+
+
+def make_rgba_from_alpha(alpha: np.ndarray, rgb=(255, 255, 255)) -> Image.Image:
+    h, w = alpha.shape
+    out = np.zeros((h, w, 4), dtype=np.uint8)
+    out[:, :, 0] = rgb[0]
+    out[:, :, 1] = rgb[1]
+    out[:, :, 2] = rgb[2]
+    out[:, :, 3] = alpha
     return Image.fromarray(out, "RGBA")
 
 
@@ -116,46 +144,36 @@ def load_texture(material: str, size: tuple[int, int]):
     return tex, str(path)
 
 
-def mask_image_to_alpha(img: Image.Image, alpha_source: Image.Image) -> Image.Image:
+def apply_alpha_mask(img: Image.Image, alpha_mask: np.ndarray) -> Image.Image:
     arr = np.array(img.convert("RGBA"))
-    alpha = np.array(alpha_source.convert("RGBA"))[:, :, 3]
-    arr[:, :, 3] = alpha
+    arr[:, :, 3] = alpha_mask
     return Image.fromarray(arr, "RGBA")
 
 
-def make_white_base(contour_img: Image.Image) -> Image.Image:
-    alpha = np.array(contour_img)[:, :, 3]
-    h, w = alpha.shape
-    out = np.zeros((h, w, 4), dtype=np.uint8)
-    out[:, :, 0:3] = 255
-    out[:, :, 3] = alpha
-    return Image.fromarray(out, "RGBA")
-
-
-def compose_final_preview(design_img: Image.Image, contour_img: Image.Image, material: str):
+def compose_final_preview(design_img: Image.Image, design_alpha: np.ndarray, sticker_alpha: np.ndarray, material: str):
     texture_path = None
     canvas = Image.new("RGBA", design_img.size, (0, 0, 0, 0))
 
     if material == "holographic":
         texture, texture_path = load_texture(material, design_img.size)
-
         if texture is not None:
-            holo_base = mask_image_to_alpha(texture, contour_img)
+            holo_base = apply_alpha_mask(texture, sticker_alpha)
             canvas.alpha_composite(holo_base)
         else:
-            white_base = make_white_base(contour_img)
+            white_base = make_rgba_from_alpha(sticker_alpha, (255, 255, 255))
             canvas.alpha_composite(white_base)
     else:
-        white_base = make_white_base(contour_img)
+        white_base = make_rgba_from_alpha(sticker_alpha, (255, 255, 255))
         canvas.alpha_composite(white_base)
 
+    # diseño negro encima
     canvas.alpha_composite(design_img)
     return canvas, texture_path
 
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": 15}
+    return {"ok": True, "version": 16}
 
 
 @app.post("/process-sticker")
@@ -165,21 +183,28 @@ async def process_sticker(
 ):
     try:
         data = await file.read()
-        img = load_rgba_from_bytes(data)
+        raw_img = load_rgba_from_bytes(data)
+        design_trimmed = trim_transparent(raw_img, padding_ratio=0.08)
 
-        design = trim_transparent(img, padding_ratio=0.10)
-        contour = fill_small_holes(design, max_hole_area=10000)
-        final_preview, texture_path = compose_final_preview(design, contour, material)
+        design_alpha = clean_design_alpha(design_trimmed, max_hole_area=10000)
+        design_img = design_trimmed.copy()
+        design_arr = np.array(design_img)
+        design_arr[:, :, 3] = design_alpha
+        design_img = Image.fromarray(design_arr, "RGBA")
+
+        sticker_alpha = make_sticker_mask(design_alpha)
+
+        contour_img = make_rgba_from_alpha(sticker_alpha, (255, 255, 255))
+        final_preview, texture_path = compose_final_preview(design_img, design_alpha, sticker_alpha, material)
 
         return JSONResponse({
             "ok": True,
-            "design_png": to_base64(design),
-            "contour_png": to_base64(contour),
             "final_preview_png": to_base64(final_preview),
+            "contour_png": to_base64(contour_img),
             "debug_material": material,
             "debug_texture_found": texture_path is not None,
             "debug_texture_path": texture_path,
-            "debug_version": 15
+            "debug_version": 16
         })
     except Exception as e:
         return JSONResponse(
