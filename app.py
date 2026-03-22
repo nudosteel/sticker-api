@@ -1,4 +1,4 @@
-# VERSION 21 - Rounded StickerApp-like contour
+# VERSION 22 - Rounded outer contour smoother like StickerApp
 
 from io import BytesIO
 import base64
@@ -88,7 +88,7 @@ def make_ellipse_kernel(size: int) -> np.ndarray:
     return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
 
 
-def smooth_mask(mask: np.ndarray, blur_size: int = 5) -> np.ndarray:
+def smooth_mask(mask: np.ndarray, blur_size: int = 7) -> np.ndarray:
     if blur_size % 2 == 0:
         blur_size += 1
     blurred = cv2.GaussianBlur(mask, (blur_size, blur_size), 0)
@@ -96,32 +96,48 @@ def smooth_mask(mask: np.ndarray, blur_size: int = 5) -> np.ndarray:
     return th
 
 
+def simplify_external_contours(mask: np.ndarray) -> np.ndarray:
+    """
+    Simplifica el contorno exterior para quitar dientes pequeños.
+    """
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = np.zeros_like(mask)
+
+    for cnt in contours:
+        peri = cv2.arcLength(cnt, True)
+        epsilon = max(1.5, 0.006 * peri)
+        approx = cv2.approxPolyDP(cnt, epsilon, True)
+        cv2.drawContours(out, [approx], -1, 255, thickness=cv2.FILLED)
+
+    return out
+
+
 def make_sticker_mask(design_alpha: np.ndarray) -> np.ndarray:
     """
-    Crea una silueta exterior más orgánica:
+    Crea una silueta exterior más redondeada:
     - dilata con kernel elíptico
     - cierre suave
-    - toma solo contornos exteriores
-    - rellena
+    - simplifica contorno
     - suaviza ligeramente
     """
     h, w = design_alpha.shape
 
-    border_px = max(20, int(max(h, w) * 0.085))
+    border_px = max(18, int(max(h, w) * 0.06))
 
     dilate_kernel = make_ellipse_kernel(border_px)
     dilated = cv2.dilate(design_alpha, dilate_kernel, iterations=1)
 
-    close_kernel = make_ellipse_kernel(max(5, border_px // 3))
+    close_kernel = make_ellipse_kernel(max(7, border_px // 2))
     closed = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, close_kernel, iterations=1)
 
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    simplified = simplify_external_contours(closed)
 
-    mask = np.zeros_like(closed)
-    cv2.drawContours(mask, contours, -1, 255, thickness=cv2.FILLED)
+    # redondeo suave extra
+    open_kernel = make_ellipse_kernel(max(5, border_px // 3))
+    rounded = cv2.morphologyEx(simplified, cv2.MORPH_OPEN, open_kernel, iterations=1)
 
-    mask = smooth_mask(mask, blur_size=5)
-    return mask
+    final_mask = smooth_mask(rounded, blur_size=7)
+    return final_mask
 
 
 def make_rgba_from_alpha(alpha: np.ndarray, rgb=(255, 255, 255)) -> Image.Image:
@@ -192,7 +208,7 @@ def compose_final_preview(design_img: Image.Image, sticker_alpha: np.ndarray, ma
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": 21}
+    return {"ok": True, "version": 22}
 
 
 @app.post("/process-sticker")
@@ -223,7 +239,7 @@ async def process_sticker(
             "debug_material": material,
             "debug_texture_found": texture_path is not None,
             "debug_texture_path": texture_path,
-            "debug_version": 21
+            "debug_version": 22
         })
     except Exception as e:
         return JSONResponse(
