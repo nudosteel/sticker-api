@@ -95,7 +95,7 @@ def make_sticker_mask(design_alpha: np.ndarray) -> np.ndarray:
     Crea el borde real del sticker dilatando el diseño.
     """
     h, w = design_alpha.shape
-    border_px = max(10, int(max(h, w) * 0.035))
+    border_px = max(14, int(max(h, w) * 0.035))
     if border_px % 2 != 0:
         border_px += 1
 
