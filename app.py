@@ -259,7 +259,7 @@ def make_sticker_mask(alpha_mask: np.ndarray) -> np.ndarray:
             cluster_mask = merge_cluster_shape(cluster_mask, max_dim)
             base = cv2.bitwise_or(base, cluster_mask)
 
-    border_px = max(18, int(max_dim * 0.06))
+    border_px = max(14, int(max_dim * 0.06))
     sticker = metaball_outline(base, border_px)
     sticker = fill_small_inner_holes(sticker, max_hole_area=4200)
 
