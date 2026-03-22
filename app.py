@@ -389,7 +389,7 @@ def compose_final_preview(design_img: Image.Image, sticker_alpha: np.ndarray, ma
     w, h = design_img.size
 
     canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    shadow = create_shadow_from_mask(sticker_alpha, blur_radius=18, opacity=70, offset=(0, 14))
+    shadow = create_shadow_from_mask(sticker_alpha, blur_radius=15, opacity=30, offset=(0, 11))
     canvas.alpha_composite(shadow)
 
     if material == "holographic":
