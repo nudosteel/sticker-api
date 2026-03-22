@@ -1,4 +1,4 @@
-# VERSION 22 - Rounded outer contour smoother like StickerApp
+# VERSION 23 - Stable contour base + fixed preferred border thickness
 
 from io import BytesIO
 import base64
@@ -82,62 +82,49 @@ def clean_design_alpha(design_img: Image.Image, max_hole_area: int = 10000) -> n
     return solid
 
 
-def make_ellipse_kernel(size: int) -> np.ndarray:
-    if size % 2 == 0:
-        size += 1
-    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+def fill_small_inner_holes(mask: np.ndarray, max_hole_area: int = 4200) -> np.ndarray:
+    solid = mask.copy()
+    inv = 255 - solid
 
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(inv, 8)
 
-def smooth_mask(mask: np.ndarray, blur_size: int = 7) -> np.ndarray:
-    if blur_size % 2 == 0:
-        blur_size += 1
-    blurred = cv2.GaussianBlur(mask, (blur_size, blur_size), 0)
-    _, th = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
-    return th
+    h, w = solid.shape
+    border = set()
+    border.update(np.unique(labels[0, :]).tolist())
+    border.update(np.unique(labels[h - 1, :]).tolist())
+    border.update(np.unique(labels[:, 0]).tolist())
+    border.update(np.unique(labels[:, w - 1]).tolist())
 
+    for i in range(1, num):
+        if i in border:
+            continue
+        if stats[i, cv2.CC_STAT_AREA] <= max_hole_area:
+            solid[labels == i] = 255
 
-def simplify_external_contours(mask: np.ndarray) -> np.ndarray:
-    """
-    Simplifica el contorno exterior para quitar dientes pequeños.
-    """
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    out = np.zeros_like(mask)
-
-    for cnt in contours:
-        peri = cv2.arcLength(cnt, True)
-        epsilon = max(2.5, 0.008 * peri)
-        approx = cv2.approxPolyDP(cnt, epsilon, True)
-        cv2.drawContours(out, [approx], -1, 255, thickness=cv2.FILLED)
-
-    return out
+    return solid
 
 
 def make_sticker_mask(design_alpha: np.ndarray) -> np.ndarray:
     """
-    Crea una silueta exterior más redondeada:
-    - dilata con kernel elíptico
-    - cierre suave
-    - simplifica contorno
-    - suaviza ligeramente
+    Base estable:
+    - mismo método que funcionaba bien
+    - borde preferido fijo para no estar ajustando
     """
     h, w = design_alpha.shape
 
-    border_px = max(21, int(max(h, w) * 0.065))
+    # AJUSTE FIJO QUE QUIERES MANTENER SIEMPRE
+    border_px = max(18, int(max(h, w) * 0.06))
+    if border_px % 2 != 0:
+        border_px += 1
 
-    dilate_kernel = make_ellipse_kernel(border_px)
-    dilated = cv2.dilate(design_alpha, dilate_kernel, iterations=1)
+    kernel = np.ones((border_px, border_px), np.uint8)
+    dilated = cv2.dilate(design_alpha, kernel, iterations=1)
 
-    close_kernel = make_ellipse_kernel(max(7, border_px // 2))
+    close_kernel = np.ones((6, 6), np.uint8)
     closed = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, close_kernel, iterations=1)
 
-    simplified = simplify_external_contours(closed)
-
-    # redondeo suave extra
-    open_kernel = make_ellipse_kernel(max(5, border_px // 3))
-    rounded = cv2.morphologyEx(simplified, cv2.MORPH_OPEN, open_kernel, iterations=1)
-
-    final_mask = smooth_mask(rounded, blur_size=7)
-    return final_mask
+    cleaned = fill_small_inner_holes(closed, max_hole_area=4200)
+    return cleaned
 
 
 def make_rgba_from_alpha(alpha: np.ndarray, rgb=(255, 255, 255)) -> Image.Image:
@@ -208,7 +195,7 @@ def compose_final_preview(design_img: Image.Image, sticker_alpha: np.ndarray, ma
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": 22}
+    return {"ok": True, "version": 23}
 
 
 @app.post("/process-sticker")
@@ -222,7 +209,6 @@ async def process_sticker(
         design_trimmed = trim_transparent(raw_img, padding_ratio=0.08)
 
         design_alpha = clean_design_alpha(design_trimmed, max_hole_area=10000)
-
         design_arr = np.array(design_trimmed)
         design_arr[:, :, 3] = design_alpha
         design_img = Image.fromarray(design_arr, "RGBA")
@@ -239,7 +225,7 @@ async def process_sticker(
             "debug_material": material,
             "debug_texture_found": texture_path is not None,
             "debug_texture_path": texture_path,
-            "debug_version": 22
+            "debug_version": 23
         })
     except Exception as e:
         return JSONResponse(
