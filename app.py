@@ -1,4 +1,4 @@
-# VERSION 23 - Stable contour base + fixed preferred border thickness
+# VERSION 24 - Smart unified silhouette + fixed border
 
 from io import BytesIO
 import base64
@@ -82,49 +82,86 @@ def clean_design_alpha(design_img: Image.Image, max_hole_area: int = 10000) -> n
     return solid
 
 
-def fill_small_inner_holes(mask: np.ndarray, max_hole_area: int = 4200) -> np.ndarray:
-    solid = mask.copy()
-    inv = 255 - solid
+def make_ellipse_kernel(size: int) -> np.ndarray:
+    size = max(3, int(size))
+    if size % 2 == 0:
+        size += 1
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
 
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(inv, 8)
 
-    h, w = solid.shape
-    border = set()
-    border.update(np.unique(labels[0, :]).tolist())
-    border.update(np.unique(labels[h - 1, :]).tolist())
-    border.update(np.unique(labels[:, 0]).tolist())
-    border.update(np.unique(labels[:, w - 1]).tolist())
+def smooth_mask(mask: np.ndarray, blur_size: int = 5) -> np.ndarray:
+    blur_size = max(3, int(blur_size))
+    if blur_size % 2 == 0:
+        blur_size += 1
+    blurred = cv2.GaussianBlur(mask, (blur_size, blur_size), 0)
+    _, th = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
+    return th
 
-    for i in range(1, num):
-        if i in border:
-            continue
-        if stats[i, cv2.CC_STAT_AREA] <= max_hole_area:
-            solid[labels == i] = 255
 
-    return solid
+def merge_nearby_components(design_alpha: np.ndarray) -> np.ndarray:
+    """
+    Une elementos cercanos como icono + texto sin cambiar demasiado la forma.
+    """
+    h, w = design_alpha.shape
+    max_dim = max(h, w)
+
+    bridge_px = max(9, int(max_dim * 0.028))
+    bridge_kernel = make_ellipse_kernel(bridge_px)
+
+    merged = cv2.morphologyEx(design_alpha, cv2.MORPH_CLOSE, bridge_kernel, iterations=1)
+    merged = smooth_mask(merged, blur_size=3)
+    return merged
+
+
+def simplify_outer_shape(mask: np.ndarray) -> np.ndarray:
+    """
+    Simplifica ligeramente el contorno exterior para quitar dientes pequeños.
+    """
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = np.zeros_like(mask)
+
+    for cnt in contours:
+        peri = cv2.arcLength(cnt, True)
+        epsilon = max(1.2, 0.0035 * peri)
+        approx = cv2.approxPolyDP(cnt, epsilon, True)
+        cv2.drawContours(out, [approx], -1, 255, thickness=cv2.FILLED)
+
+    return out
 
 
 def make_sticker_mask(design_alpha: np.ndarray) -> np.ndarray:
     """
-    Base estable:
-    - mismo método que funcionaba bien
-    - borde preferido fijo para no estar ajustando
+    VERSION 24:
+    - une componentes cercanos
+    - genera borde fijo preferido
+    - redondea ligeramente
+    - devuelve silueta exterior limpia
     """
     h, w = design_alpha.shape
+    max_dim = max(h, w)
 
-    # AJUSTE FIJO QUE QUIERES MANTENER SIEMPRE
-    border_px = max(18, int(max(h, w) * 0.06))
-    if border_px % 2 != 0:
-        border_px += 1
+    merged_design = merge_nearby_components(design_alpha)
 
-    kernel = np.ones((border_px, border_px), np.uint8)
-    dilated = cv2.dilate(design_alpha, kernel, iterations=1)
+    # AJUSTE FIJO DEL BORDE
+    border_px = max(18, int(max_dim * 0.06))
+    border_kernel = make_ellipse_kernel(border_px)
+    dilated = cv2.dilate(merged_design, border_kernel, iterations=1)
 
-    close_kernel = np.ones((6, 6), np.uint8)
+    close_kernel = make_ellipse_kernel(max(9, border_px // 2))
     closed = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, close_kernel, iterations=1)
 
-    cleaned = fill_small_inner_holes(closed, max_hole_area=4200)
-    return cleaned
+    simplified = simplify_outer_shape(closed)
+
+    round_kernel = make_ellipse_kernel(max(5, border_px // 3))
+    rounded = cv2.morphologyEx(simplified, cv2.MORPH_OPEN, round_kernel, iterations=1)
+    rounded = cv2.morphologyEx(rounded, cv2.MORPH_CLOSE, round_kernel, iterations=1)
+
+    contours, _ = cv2.findContours(rounded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    final_mask = np.zeros_like(rounded)
+    cv2.drawContours(final_mask, contours, -1, 255, thickness=cv2.FILLED)
+
+    final_mask = smooth_mask(final_mask, blur_size=5)
+    return final_mask
 
 
 def make_rgba_from_alpha(alpha: np.ndarray, rgb=(255, 255, 255)) -> Image.Image:
@@ -195,7 +232,7 @@ def compose_final_preview(design_img: Image.Image, sticker_alpha: np.ndarray, ma
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": 23}
+    return {"ok": True, "version": 24}
 
 
 @app.post("/process-sticker")
@@ -209,6 +246,7 @@ async def process_sticker(
         design_trimmed = trim_transparent(raw_img, padding_ratio=0.08)
 
         design_alpha = clean_design_alpha(design_trimmed, max_hole_area=10000)
+
         design_arr = np.array(design_trimmed)
         design_arr[:, :, 3] = design_alpha
         design_img = Image.fromarray(design_arr, "RGBA")
@@ -225,7 +263,7 @@ async def process_sticker(
             "debug_material": material,
             "debug_texture_found": texture_path is not None,
             "debug_texture_path": texture_path,
-            "debug_version": 23
+            "debug_version": 24
         })
     except Exception as e:
         return JSONResponse(
