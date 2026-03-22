@@ -1,4 +1,4 @@
-# VERSION 34.4 - Better JPG logo extraction on light backgrounds + contour/shadow
+# VERSION 34.5 - Better JPG extraction + antialias on design edges
 
 from io import BytesIO
 import base64
@@ -110,6 +110,20 @@ def sanitize_design_rgba(design_trimmed: Image.Image) -> Image.Image:
     return Image.fromarray(arr, "RGBA")
 
 
+def antialias_rgba_edges(img: Image.Image, sigma: float = 0.9) -> Image.Image:
+    """
+    Suaviza solo el alpha del diseño para que JPGs no queden dentados.
+    """
+    arr = np.array(img.convert("RGBA")).copy()
+    alpha = arr[:, :, 3].astype(np.float32) / 255.0
+
+    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    alpha = np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
+
+    arr[:, :, 3] = alpha
+    return Image.fromarray(arr, "RGBA")
+
+
 def build_alpha_mask(design_img: Image.Image) -> np.ndarray:
     arr = np.array(design_img)
     alpha = arr[:, :, 3].astype(np.uint8)
@@ -130,21 +144,14 @@ def extract_logo_from_light_background(img: Image.Image) -> Image.Image:
     sat = hsv[:, :, 1]
     val = hsv[:, :, 2]
 
-    # foreground si no es fondo claro
-    # conserva:
-    # - píxeles oscuros
-    # - píxeles saturados/coloreados
     fg = ((val < 245) | (sat > 25)).astype(np.uint8) * 255
 
-    # quita ruido pequeño
     k1 = make_ellipse_kernel(3)
     fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, k1, iterations=1)
 
-    # une ligeramente trazos
     k2 = make_ellipse_kernel(5)
     fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, k2, iterations=1)
 
-    # quedarnos solo con componentes relevantes
     num, labels, stats, _ = cv2.connectedComponentsWithStats(fg, 8)
     clean = np.zeros_like(fg)
     h, w = fg.shape
@@ -155,13 +162,12 @@ def extract_logo_from_light_background(img: Image.Image) -> Image.Image:
         if area >= min_area:
             clean[labels == i] = 255
 
-    # suavizado ligero del alpha
-    alpha = Image.fromarray(clean, "L").filter(ImageFilter.GaussianBlur(radius=1))
-    alpha_np = np.array(alpha)
-    alpha_np = np.where(alpha_np > 18, alpha_np, 0).astype(np.uint8)
+    alpha = clean.astype(np.float32) / 255.0
+    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=1.2, sigmaY=1.2)
+    alpha = np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
 
-    out = np.array(rgba)
-    out[:, :, 3] = alpha_np
+    out = np.array(rgba).copy()
+    out[:, :, 3] = alpha
     return Image.fromarray(out, "RGBA")
 
 
@@ -180,7 +186,6 @@ def prepare_input_image(img: Image.Image) -> tuple[Image.Image, str]:
     light_alpha = np.array(light_bg)[:, :, 3]
     coverage = float(np.count_nonzero(light_alpha)) / float(light_alpha.size)
 
-    # si detectamos algo razonable, usarlo
     if 0.001 < coverage < 0.55:
         return light_bg, "light_bg"
 
@@ -438,7 +443,7 @@ def compose_final_preview(design_img: Image.Image, sticker_alpha: np.ndarray, ma
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": "34.4"}
+    return {"ok": True, "version": "34.5"}
 
 
 @app.post("/process-sticker")
@@ -450,6 +455,7 @@ async def process_sticker(file: UploadFile = File(...), material: str = Form("vi
         prepared_img, bg_method = prepare_input_image(raw_img)
         design_trimmed = trim_transparent(prepared_img, padding_ratio=0.08)
         clean_design = sanitize_design_rgba(design_trimmed)
+        clean_design = antialias_rgba_edges(clean_design, sigma=0.9)
         padded_design = add_canvas_padding(clean_design, padding_ratio=0.14, min_px=70)
 
         alpha_mask = build_alpha_mask(padded_design)
@@ -460,7 +466,7 @@ async def process_sticker(file: UploadFile = File(...), material: str = Form("vi
         return JSONResponse({
             "ok": True,
             "final_preview_png": to_base64(final_preview),
-            "debug_version": "34.4",
+            "debug_version": "34.5",
             "debug_texture_found": texture_path is not None,
             "debug_texture_path": texture_path,
             "debug_bg_method": bg_method
