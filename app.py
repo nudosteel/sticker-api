@@ -1,8 +1,9 @@
-# VERSION 24 - Smart unified silhouette + fixed border
+# VERSION 25 - Intelligent component clustering + fixed border
 
 from io import BytesIO
 import base64
 from pathlib import Path
+import math
 
 import cv2
 import numpy as np
@@ -58,6 +59,13 @@ def trim_transparent(img: Image.Image, padding_ratio: float = 0.08) -> Image.Ima
     return Image.fromarray(cropped, "RGBA")
 
 
+def make_ellipse_kernel(size: int) -> np.ndarray:
+    size = max(3, int(size))
+    if size % 2 == 0:
+        size += 1
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+
+
 def clean_design_alpha(design_img: Image.Image, max_hole_area: int = 10000) -> np.ndarray:
     arr = np.array(design_img)
     alpha = arr[:, :, 3]
@@ -82,85 +90,173 @@ def clean_design_alpha(design_img: Image.Image, max_hole_area: int = 10000) -> n
     return solid
 
 
-def make_ellipse_kernel(size: int) -> np.ndarray:
-    size = max(3, int(size))
-    if size % 2 == 0:
-        size += 1
-    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+def fill_small_inner_holes(mask: np.ndarray, max_hole_area: int = 4200) -> np.ndarray:
+    solid = mask.copy()
+    inv = 255 - solid
+
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(inv, 8)
+
+    h, w = solid.shape
+    border = set()
+    border.update(np.unique(labels[0, :]).tolist())
+    border.update(np.unique(labels[h - 1, :]).tolist())
+    border.update(np.unique(labels[:, 0]).tolist())
+    border.update(np.unique(labels[:, w - 1]).tolist())
+
+    for i in range(1, num):
+        if i in border:
+            continue
+        if stats[i, cv2.CC_STAT_AREA] <= max_hole_area:
+            solid[labels == i] = 255
+
+    return solid
 
 
-def smooth_mask(mask: np.ndarray, blur_size: int = 5) -> np.ndarray:
-    blur_size = max(3, int(blur_size))
-    if blur_size % 2 == 0:
-        blur_size += 1
-    blurred = cv2.GaussianBlur(mask, (blur_size, blur_size), 0)
-    _, th = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
-    return th
+def get_components(mask: np.ndarray, min_area: int = 20):
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    comps = []
+    for i in range(1, num):
+        x = stats[i, cv2.CC_STAT_LEFT]
+        y = stats[i, cv2.CC_STAT_TOP]
+        w = stats[i, cv2.CC_STAT_WIDTH]
+        h = stats[i, cv2.CC_STAT_HEIGHT]
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area < min_area:
+            continue
+        comps.append({
+            "id": i,
+            "x1": x,
+            "y1": y,
+            "x2": x + w - 1,
+            "y2": y + h - 1,
+            "w": w,
+            "h": h,
+            "area": area
+        })
+    return comps, labels
 
 
-def merge_nearby_components(design_alpha: np.ndarray) -> np.ndarray:
-    """
-    Une elementos cercanos como icono + texto sin cambiar demasiado la forma.
-    """
-    h, w = design_alpha.shape
-    max_dim = max(h, w)
+def bbox_gap(a, b):
+    dx = max(0, max(a["x1"], b["x1"]) - min(a["x2"], b["x2"]))
+    dy = max(0, max(a["y1"], b["y1"]) - min(a["y2"], b["y2"]))
+    return math.hypot(dx, dy), dx, dy
 
-    bridge_px = max(9, int(max_dim * 0.028))
+
+def overlap_ratio_1d(a1, a2, b1, b2):
+    inter = max(0, min(a2, b2) - max(a1, b1))
+    span = max(1, min(a2 - a1, b2 - b1))
+    return inter / span
+
+
+class DSU:
+    def __init__(self, n):
+        self.p = list(range(n))
+
+    def find(self, x):
+        while self.p[x] != x:
+            self.p[x] = self.p[self.p[x]]
+            x = self.p[x]
+        return x
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.p[rb] = ra
+
+
+def cluster_components(components, max_dim):
+    if not components:
+        return []
+
+    dsu = DSU(len(components))
+
+    base_gap = max(10, int(max_dim * 0.03))
+    strong_gap = max(14, int(max_dim * 0.045))
+
+    for i in range(len(components)):
+        for j in range(i + 1, len(components)):
+            a = components[i]
+            b = components[j]
+
+            gap, dx, dy = bbox_gap(a, b)
+            y_overlap = overlap_ratio_1d(a["y1"], a["y2"], b["y1"], b["y2"])
+            x_overlap = overlap_ratio_1d(a["x1"], a["x2"], b["x1"], b["x2"])
+
+            # unión inteligente:
+            # - elementos cercanos en la misma línea (icono + texto)
+            # - letras cercanas entre sí
+            # - piezas casi tocándose
+            should_join = (
+                gap <= base_gap or
+                (dx <= strong_gap and y_overlap > 0.20) or
+                (dy <= strong_gap and x_overlap > 0.20)
+            )
+
+            if should_join:
+                dsu.union(i, j)
+
+    groups = {}
+    for idx, comp in enumerate(components):
+        root = dsu.find(idx)
+        groups.setdefault(root, []).append(comp)
+
+    return list(groups.values())
+
+
+def merge_component_cluster(labels, cluster, max_dim):
+    mask = np.zeros(labels.shape, dtype=np.uint8)
+    ids = [c["id"] for c in cluster]
+    ids_set = set(ids)
+    mask[np.isin(labels, list(ids_set))] = 255
+
+    # une piezas cercanas dentro del cluster
+    bridge_px = max(7, int(max_dim * 0.02))
     bridge_kernel = make_ellipse_kernel(bridge_px)
+    merged = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, bridge_kernel, iterations=1)
 
-    merged = cv2.morphologyEx(design_alpha, cv2.MORPH_CLOSE, bridge_kernel, iterations=1)
-    merged = smooth_mask(merged, blur_size=3)
     return merged
-
-
-def simplify_outer_shape(mask: np.ndarray) -> np.ndarray:
-    """
-    Simplifica ligeramente el contorno exterior para quitar dientes pequeños.
-    """
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    out = np.zeros_like(mask)
-
-    for cnt in contours:
-        peri = cv2.arcLength(cnt, True)
-        epsilon = max(1.2, 0.0035 * peri)
-        approx = cv2.approxPolyDP(cnt, epsilon, True)
-        cv2.drawContours(out, [approx], -1, 255, thickness=cv2.FILLED)
-
-    return out
 
 
 def make_sticker_mask(design_alpha: np.ndarray) -> np.ndarray:
     """
-    VERSION 24:
-    - une componentes cercanos
-    - genera borde fijo preferido
-    - redondea ligeramente
-    - devuelve silueta exterior limpia
+    VERSION 25:
+    - detecta componentes
+    - une solo componentes cercanos
+    - genera borde fijo
+    - conserva una silueta limpia y estable
     """
     h, w = design_alpha.shape
     max_dim = max(h, w)
 
-    merged_design = merge_nearby_components(design_alpha)
+    # limpia ruido mínimo
+    open_kernel = make_ellipse_kernel(max(3, int(max_dim * 0.006)))
+    cleaned = cv2.morphologyEx(design_alpha, cv2.MORPH_OPEN, open_kernel, iterations=1)
 
-    # AJUSTE FIJO DEL BORDE
+    components, labels = get_components(cleaned, min_area=max(20, int(max_dim * 0.002)))
+    clusters = cluster_components(components, max_dim)
+
+    merged_global = np.zeros_like(cleaned)
+    for cluster in clusters:
+        cluster_mask = merge_component_cluster(labels, cluster, max_dim)
+        merged_global = cv2.bitwise_or(merged_global, cluster_mask)
+
+    # AJUSTE FIJO DEL BORDE QUE QUIERES MANTENER
     border_px = max(18, int(max_dim * 0.06))
     border_kernel = make_ellipse_kernel(border_px)
-    dilated = cv2.dilate(merged_design, border_kernel, iterations=1)
+    dilated = cv2.dilate(merged_global, border_kernel, iterations=1)
 
-    close_kernel = make_ellipse_kernel(max(9, border_px // 2))
-    closed = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+    # suavizado estructural, no blur destructivo
+    close_size = max(5, border_px // 3)
+    close_kernel = make_ellipse_kernel(close_size)
+    shaped = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+    shaped = cv2.morphologyEx(shaped, cv2.MORPH_OPEN, close_kernel, iterations=1)
 
-    simplified = simplify_outer_shape(closed)
+    shaped = fill_small_inner_holes(shaped, max_hole_area=4200)
 
-    round_kernel = make_ellipse_kernel(max(5, border_px // 3))
-    rounded = cv2.morphologyEx(simplified, cv2.MORPH_OPEN, round_kernel, iterations=1)
-    rounded = cv2.morphologyEx(rounded, cv2.MORPH_CLOSE, round_kernel, iterations=1)
-
-    contours, _ = cv2.findContours(rounded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    final_mask = np.zeros_like(rounded)
+    contours, _ = cv2.findContours(shaped, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    final_mask = np.zeros_like(shaped)
     cv2.drawContours(final_mask, contours, -1, 255, thickness=cv2.FILLED)
 
-    final_mask = smooth_mask(final_mask, blur_size=5)
     return final_mask
 
 
@@ -232,7 +328,7 @@ def compose_final_preview(design_img: Image.Image, sticker_alpha: np.ndarray, ma
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": 24}
+    return {"ok": True, "version": 25}
 
 
 @app.post("/process-sticker")
@@ -249,6 +345,13 @@ async def process_sticker(
 
         design_arr = np.array(design_trimmed)
         design_arr[:, :, 3] = design_alpha
+
+        # limpia RGB basura en píxeles casi transparentes
+        low_alpha = design_arr[:, :, 3] < 20
+        design_arr[low_alpha, 0] = 0
+        design_arr[low_alpha, 1] = 0
+        design_arr[low_alpha, 2] = 0
+
         design_img = Image.fromarray(design_arr, "RGBA")
 
         sticker_alpha = make_sticker_mask(design_alpha)
@@ -263,7 +366,7 @@ async def process_sticker(
             "debug_material": material,
             "debug_texture_found": texture_path is not None,
             "debug_texture_path": texture_path,
-            "debug_version": 24
+            "debug_version": 25
         })
     except Exception as e:
         return JSONResponse(
