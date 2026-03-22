@@ -1,4 +1,4 @@
-# VERSION 26 - Rounded contour + dirty edge color cleanup
+# VERSION 27 - Alpha-driven contour + dirty edge cleanup
 
 from io import BytesIO
 import base64
@@ -65,15 +65,22 @@ def make_ellipse_kernel(size: int) -> np.ndarray:
     return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
 
 
-def clean_design_alpha(design_img: Image.Image, max_hole_area: int = 10000) -> np.ndarray:
+def build_alpha_mask(design_img: Image.Image) -> np.ndarray:
+    """
+    Usa SOLO alpha.
+    Así da igual si el arte es negro, naranja o cualquier color.
+    """
     arr = np.array(design_img)
-    alpha = arr[:, :, 3]
-    solid = np.where(alpha > 0, 255, 0).astype(np.uint8)
+    alpha = arr[:, :, 3].astype(np.uint8)
 
-    inv = 255 - solid
+    # Umbral suave para conservar bordes más naturales
+    mask = np.where(alpha >= 8, 255, 0).astype(np.uint8)
+
+    # Cerrar huecos internos pequeños del alpha
+    inv = 255 - mask
     num, labels, stats, _ = cv2.connectedComponentsWithStats(inv, 8)
 
-    h, w = solid.shape
+    h, w = mask.shape
     border = set()
     border.update(np.unique(labels[0, :]).tolist())
     border.update(np.unique(labels[h - 1, :]).tolist())
@@ -83,10 +90,10 @@ def clean_design_alpha(design_img: Image.Image, max_hole_area: int = 10000) -> n
     for i in range(1, num):
         if i in border:
             continue
-        if stats[i, cv2.CC_STAT_AREA] <= max_hole_area:
-            solid[labels == i] = 255
+        if stats[i, cv2.CC_STAT_AREA] <= 10000:
+            mask[labels == i] = 255
 
-    return solid
+    return mask
 
 
 def fill_small_inner_holes(mask: np.ndarray, max_hole_area: int = 4200) -> np.ndarray:
@@ -111,23 +118,20 @@ def fill_small_inner_holes(mask: np.ndarray, max_hole_area: int = 4200) -> np.nd
     return solid
 
 
-def sanitize_design_rgba(design_trimmed: Image.Image, design_alpha: np.ndarray) -> Image.Image:
+def sanitize_design_rgba(design_trimmed: Image.Image) -> Image.Image:
     """
-    Limpia color sucio en bordes semitransparentes.
-    No recolorea el diseño real; solo neutraliza píxeles de alpha bajo/medio.
+    Limpia halos o tonos raros en bordes semitransparentes.
     """
     arr = np.array(design_trimmed).astype(np.uint8)
-    arr[:, :, 3] = design_alpha
-
     alpha = arr[:, :, 3].astype(np.float32) / 255.0
     rgb = arr[:, :, :3].astype(np.float32)
 
-    # píxeles casi invisibles: color a negro
-    very_low = arr[:, :, 3] < 20
+    # Muy bajo alpha: limpiar totalmente
+    very_low = arr[:, :, 3] < 12
     rgb[very_low] = 0
 
-    # píxeles semitransparentes: neutralizar matte raro sobre base blanca
-    semi = (arr[:, :, 3] >= 20) & (arr[:, :, 3] < 245)
+    # Semitransparencias: neutralizar suciedad de color
+    semi = (arr[:, :, 3] >= 12) & (arr[:, :, 3] < 245)
     if np.any(semi):
         a = alpha[semi][:, None]
         rgb[semi] = rgb[semi] * a + 255.0 * (1.0 - a)
@@ -138,8 +142,7 @@ def sanitize_design_rgba(design_trimmed: Image.Image, design_alpha: np.ndarray) 
 
 def merge_nearby_components(mask: np.ndarray) -> np.ndarray:
     """
-    Une componentes cercanos sin destruir la forma.
-    Ayuda en casos como icono + texto.
+    Une piezas cercanas sin depender del color.
     """
     h, w = mask.shape
     max_dim = max(h, w)
@@ -151,25 +154,20 @@ def merge_nearby_components(mask: np.ndarray) -> np.ndarray:
     return merged
 
 
-def make_sticker_mask(design_alpha: np.ndarray) -> np.ndarray:
+def make_sticker_mask(alpha_mask: np.ndarray) -> np.ndarray:
     """
-    VERSION 26:
-    - une componentes cercanos suavemente
-    - aplica el borde fijo que te gusta
-    - redondea un poco el contorno
-    - sin blur destructivo
+    Contorno final basado en alpha.
     """
-    h, w = design_alpha.shape
+    h, w = alpha_mask.shape
 
-    merged = merge_nearby_components(design_alpha)
+    merged = merge_nearby_components(alpha_mask)
 
-    # AJUSTE FIJO DEL BORDE
+    # GROSOR FIJO QUE QUIERES MANTENER
     border_px = max(18, int(max(h, w) * 0.06))
     border_kernel = make_ellipse_kernel(border_px)
     dilated = cv2.dilate(merged, border_kernel, iterations=1)
 
-    # redondeo estructural
-    round_size = max(5, border_px // 3)
+    round_size = max(7, border_px // 2)
     round_kernel = make_ellipse_kernel(round_size)
 
     shaped = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, round_kernel, iterations=1)
@@ -252,7 +250,7 @@ def compose_final_preview(design_img: Image.Image, sticker_alpha: np.ndarray, ma
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": 26}
+    return {"ok": True, "version": 27}
 
 
 @app.post("/process-sticker")
@@ -265,13 +263,13 @@ async def process_sticker(
         raw_img = load_rgba_from_bytes(data)
         design_trimmed = trim_transparent(raw_img, padding_ratio=0.08)
 
-        design_alpha = clean_design_alpha(design_trimmed, max_hole_area=10000)
-        design_img = sanitize_design_rgba(design_trimmed, design_alpha)
+        clean_design = sanitize_design_rgba(design_trimmed)
+        alpha_mask = build_alpha_mask(clean_design)
 
-        sticker_alpha = make_sticker_mask(design_alpha)
+        sticker_alpha = make_sticker_mask(alpha_mask)
 
         contour_img = make_rgba_from_alpha(sticker_alpha, (255, 255, 255))
-        final_preview, texture_path = compose_final_preview(design_img, sticker_alpha, material)
+        final_preview, texture_path = compose_final_preview(clean_design, sticker_alpha, material)
 
         return JSONResponse({
             "ok": True,
@@ -280,7 +278,7 @@ async def process_sticker(
             "debug_material": material,
             "debug_texture_found": texture_path is not None,
             "debug_texture_path": texture_path,
-            "debug_version": 26
+            "debug_version": 27
         })
     except Exception as e:
         return JSONResponse(
