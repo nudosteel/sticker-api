@@ -365,7 +365,7 @@ def make_sticker_mask(alpha_mask: np.ndarray, border_ratio: float = 0.05) -> np.
     """Now accepts configurable border_ratio (default 0.05 = 5% of max dimension)."""
     h, w = alpha_mask.shape
     max_dim = max(h, w)
-    comps, labels = get_components(alpha_mask, min_area=max(14, int(max_dim * 0.001)))
+    comps, labels = get_components(alpha_mask, min_area=max(12, int(max_dim * 0.001)))
     clusters = cluster_components(comps, max_dim)
     if not clusters:
         base = alpha_mask.copy()
