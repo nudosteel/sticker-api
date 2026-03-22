@@ -1,4 +1,4 @@
-# VERSION 34 - Final preview with shadow rendered in Python
+# VERSION 34.1 - Add internal canvas padding so preview doesn't clip
 
 from io import BytesIO
 import base64
@@ -45,6 +45,7 @@ def trim_transparent(img: Image.Image, padding_ratio: float = 0.08) -> Image.Ima
 
     x1, x2 = xs.min(), xs.max()
     y1, y2 = ys.min(), ys.max()
+
     w = x2 - x1 + 1
     h = y2 - y1 + 1
     pad = int(max(w, h) * padding_ratio)
@@ -54,7 +55,16 @@ def trim_transparent(img: Image.Image, padding_ratio: float = 0.08) -> Image.Ima
     right = min(arr.shape[1], x2 + pad + 1)
     bottom = min(arr.shape[0], y2 + pad + 1)
 
-    return Image.fromarray(arr[top:bottom, left:right], "RGBA")
+    cropped = arr[top:bottom, left:right]
+    return Image.fromarray(cropped, "RGBA")
+
+
+def add_canvas_padding(img: Image.Image, padding_ratio: float = 0.14, min_px: int = 70) -> Image.Image:
+    w, h = img.size
+    pad = max(min_px, int(max(w, h) * padding_ratio))
+    canvas = Image.new("RGBA", (w + pad * 2, h + pad * 2), (0, 0, 0, 0))
+    canvas.alpha_composite(img, dest=(pad, pad))
+    return canvas
 
 
 def make_ellipse_kernel(w: int, h: int = None) -> np.ndarray:
@@ -307,7 +317,6 @@ def apply_alpha_mask(img: Image.Image, alpha_mask: np.ndarray) -> Image.Image:
 def create_shadow_from_mask(mask: np.ndarray, blur_radius: int = 18, opacity: int = 70, offset=(0, 14)) -> Image.Image:
     h, w = mask.shape
     alpha = Image.fromarray(mask, "L")
-    shadow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
 
     shadow_alpha = alpha.filter(ImageFilter.GaussianBlur(radius=blur_radius))
     shadow_rgba = Image.new("RGBA", (w, h), (0, 0, 0, opacity))
@@ -343,7 +352,7 @@ def compose_final_preview(design_img: Image.Image, sticker_alpha: np.ndarray, ma
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": "34"}
+    return {"ok": True, "version": "34.1"}
 
 
 @app.post("/process-sticker")
@@ -351,18 +360,22 @@ async def process_sticker(file: UploadFile = File(...), material: str = Form("vi
     try:
         data = await file.read()
         raw_img = load_rgba_from_bytes(data)
-        design_trimmed = trim_transparent(raw_img, padding_ratio=0.08)
 
+        design_trimmed = trim_transparent(raw_img, padding_ratio=0.08)
         clean_design = sanitize_design_rgba(design_trimmed)
-        alpha_mask = build_alpha_mask(clean_design)
+
+        # ESTE ES EL CAMBIO IMPORTANTE
+        padded_design = add_canvas_padding(clean_design, padding_ratio=0.14, min_px=70)
+
+        alpha_mask = build_alpha_mask(padded_design)
         sticker_alpha = make_sticker_mask(alpha_mask)
 
-        final_preview, texture_path = compose_final_preview(clean_design, sticker_alpha, material)
+        final_preview, texture_path = compose_final_preview(padded_design, sticker_alpha, material)
 
         return JSONResponse({
             "ok": True,
             "final_preview_png": to_base64(final_preview),
-            "debug_version": "34",
+            "debug_version": "34.1",
             "debug_texture_found": texture_path is not None,
             "debug_texture_path": texture_path
         })
