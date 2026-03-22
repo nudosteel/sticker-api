@@ -1,4 +1,4 @@
-# VERSION 34.2 - Final preview with shadow rendered in Python + thinner border
+# VERSION 34.3 - Auto remove background for JPG/opaque PNG + existing contour/shadow flow
 
 from io import BytesIO
 import base64
@@ -12,6 +12,7 @@ from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageFilter
+from rembg import remove
 
 app = FastAPI()
 
@@ -34,6 +35,26 @@ def to_base64(img: Image.Image) -> str:
 
 def load_rgba_from_bytes(data: bytes) -> Image.Image:
     return Image.open(BytesIO(data)).convert("RGBA")
+
+
+def has_useful_alpha(img: Image.Image) -> bool:
+    img = img.convert("RGBA")
+    alpha = np.array(img)[:, :, 3]
+    return bool(np.any(alpha < 250))
+
+
+def remove_background_with_rembg(img: Image.Image) -> Image.Image:
+    buf = BytesIO()
+    img.convert("RGBA").save(buf, format="PNG")
+    out = remove(buf.getvalue())
+    return Image.open(BytesIO(out)).convert("RGBA")
+
+
+def prepare_input_image(img: Image.Image) -> Image.Image:
+    img = img.convert("RGBA")
+    if has_useful_alpha(img):
+        return img
+    return remove_background_with_rembg(img)
 
 
 def trim_transparent(img: Image.Image, padding_ratio: float = 0.08) -> Image.Image:
@@ -352,7 +373,7 @@ def compose_final_preview(design_img: Image.Image, sticker_alpha: np.ndarray, ma
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": "34.2"}
+    return {"ok": True, "version": "34.3"}
 
 
 @app.post("/process-sticker")
@@ -361,7 +382,8 @@ async def process_sticker(file: UploadFile = File(...), material: str = Form("vi
         data = await file.read()
         raw_img = load_rgba_from_bytes(data)
 
-        design_trimmed = trim_transparent(raw_img, padding_ratio=0.08)
+        prepared_img = prepare_input_image(raw_img)
+        design_trimmed = trim_transparent(prepared_img, padding_ratio=0.08)
         clean_design = sanitize_design_rgba(design_trimmed)
         padded_design = add_canvas_padding(clean_design, padding_ratio=0.14, min_px=70)
 
@@ -373,9 +395,10 @@ async def process_sticker(file: UploadFile = File(...), material: str = Form("vi
         return JSONResponse({
             "ok": True,
             "final_preview_png": to_base64(final_preview),
-            "debug_version": "34.2",
+            "debug_version": "34.3",
             "debug_texture_found": texture_path is not None,
-            "debug_texture_path": texture_path
+            "debug_texture_path": texture_path,
+            "debug_bg_removed": not has_useful_alpha(raw_img.convert("RGBA"))
         })
     except Exception as e:
         return JSONResponse(
