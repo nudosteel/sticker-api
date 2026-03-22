@@ -1,4 +1,4 @@
-# VERSION 30 - Alpha + distance transform + soft metaball smoothing
+# VERSION 29 gemini - Smooth Bubble cutline: Gaussian Blur + Threshold approach
 
 from io import BytesIO
 import base64
@@ -59,22 +59,14 @@ def trim_transparent(img: Image.Image, padding_ratio: float = 0.08) -> Image.Ima
     return Image.fromarray(cropped, "RGBA")
 
 
-def make_ellipse_kernel(w: int, h: int | None = None) -> np.ndarray:
-    if h is None:
-        h = w
-    w = max(3, int(w))
-    h = max(3, int(h))
-    if w % 2 == 0:
-        w += 1
-    if h % 2 == 0:
-        h += 1
-    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (w, h))
+def make_ellipse_kernel(size: int) -> np.ndarray:
+    size = max(3, int(size))
+    if size % 2 == 0:
+        size += 1
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
 
 
 def sanitize_design_rgba(design_trimmed: Image.Image) -> Image.Image:
-    """
-    Limpia halos / colores basura en bordes semitransparentes.
-    """
     arr = np.array(design_trimmed).astype(np.uint8)
     alpha = arr[:, :, 3].astype(np.float32) / 255.0
     rgb = arr[:, :, :3].astype(np.float32)
@@ -85,7 +77,6 @@ def sanitize_design_rgba(design_trimmed: Image.Image) -> Image.Image:
     semi = (arr[:, :, 3] >= 12) & (arr[:, :, 3] < 245)
     if np.any(semi):
         a = alpha[semi][:, None]
-        # neutraliza matte raro sobre blanco
         rgb[semi] = rgb[semi] * a + 255.0 * (1.0 - a)
 
     arr[:, :, :3] = np.clip(rgb, 0, 255).astype(np.uint8)
@@ -93,16 +84,11 @@ def sanitize_design_rgba(design_trimmed: Image.Image) -> Image.Image:
 
 
 def build_alpha_mask(design_img: Image.Image) -> np.ndarray:
-    """
-    Usa solo alpha.
-    """
     arr = np.array(design_img)
     alpha = arr[:, :, 3].astype(np.uint8)
 
-    # umbral bajo para conservar suavidad de borde
     mask = np.where(alpha >= 8, 255, 0).astype(np.uint8)
 
-    # rellena huecos pequeños internos del arte
     inv = 255 - mask
     num, labels, stats, _ = cv2.connectedComponentsWithStats(inv, 8)
 
@@ -175,18 +161,14 @@ class DSU:
 
 
 def cluster_components(components, max_dim):
-    """
-    Une piezas cercanas.
-    Más suave en horizontal, más permisivo si parece un lockup de 2 líneas.
-    """
     if not components:
         return []
 
     dsu = DSU(len(components))
 
-    gap_x = max(10, int(max_dim * 0.035))
-    gap_y = max(10, int(max_dim * 0.04))
-    diag_gap = max(12, int(max_dim * 0.045))
+    horizontal_gap = max(12, int(max_dim * 0.05))
+    vertical_gap = max(10, int(max_dim * 0.04))
+    diag_gap = max(14, int(max_dim * 0.055))
 
     for i in range(len(components)):
         for j in range(i + 1, len(components)):
@@ -195,15 +177,11 @@ def cluster_components(components, max_dim):
 
             dx, dy, dist = bbox_gap(a, b)
 
-            # una línea: letras/piezas cercanas
-            same_row = dy <= gap_y and dx <= gap_x * 2
+            same_row_like = dy <= vertical_gap
+            stacked_like = dx <= horizontal_gap
+            near_enough = dist <= diag_gap
 
-            # dos líneas / icono+texto
-            stacked = dx <= gap_x and dy <= gap_y * 2
-
-            near = dist <= diag_gap
-
-            if same_row or stacked or near:
+            if same_row_like or stacked_like or near_enough:
                 dsu.union(i, j)
 
     groups = {}
@@ -214,79 +192,11 @@ def cluster_components(components, max_dim):
     return list(groups.values())
 
 
-def cluster_mask_from_labels(labels: np.ndarray, cluster) -> np.ndarray:
+def merge_cluster_mask(labels: np.ndarray, cluster) -> np.ndarray:
     mask = np.zeros(labels.shape, dtype=np.uint8)
     ids = [c["id"] for c in cluster]
     mask[np.isin(labels, ids)] = 255
     return mask
-
-
-def merge_cluster_shape(cluster_mask: np.ndarray, max_dim: int) -> np.ndarray:
-    """
-    Une piezas del cluster de manera controlada.
-    """
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(cluster_mask, 8)
-    if num <= 2:
-        return cluster_mask
-
-    comps = []
-    for i in range(1, num):
-        x = stats[i, cv2.CC_STAT_LEFT]
-        y = stats[i, cv2.CC_STAT_TOP]
-        w = stats[i, cv2.CC_STAT_WIDTH]
-        h = stats[i, cv2.CC_STAT_HEIGHT]
-        comps.append((x, y, w, h))
-
-    xs = [c[0] for c in comps]
-    ys = [c[1] for c in comps]
-    ws = [c[2] for c in comps]
-    hs = [c[3] for c in comps]
-
-    total_w = (max(x + w for x, y, w, h in comps) - min(xs)) if comps else 0
-    total_h = (max(y + h for x, y, w, h in comps) - min(ys)) if comps else 0
-
-    # si es más ancho que alto: palabra/logotipo en línea
-    if total_w >= total_h * 1.4:
-        kx = max(5, int(max_dim * 0.012))
-        ky = max(3, int(max_dim * 0.006))
-        kernel = make_ellipse_kernel(kx, ky)
-    else:
-        # lockup más vertical / 2 líneas
-        kx = max(5, int(max_dim * 0.010))
-        ky = max(7, int(max_dim * 0.016))
-        kernel = make_ellipse_kernel(kx, ky)
-
-    merged = cv2.morphologyEx(cluster_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-    return merged
-
-
-def metaball_outline(mask: np.ndarray, border_px: int) -> np.ndarray:
-    """
-    Borde orgánico:
-    - offset euclidiano con distance transform
-    - blur gaussiano controlado
-    - threshold final
-    """
-    # offset redondo real
-    inv = 255 - mask
-    dist = cv2.distanceTransform(inv, cv2.DIST_L2, 5)
-    expanded = np.where(dist <= border_px, 255, 0).astype(np.uint8)
-
-    # suavizado tipo metaball, controlado
-    blur = max(5, int(border_px * 0.55))
-    if blur % 2 == 0:
-        blur += 1
-
-    blurred = cv2.GaussianBlur(expanded, (blur, blur), 0)
-    _, smooth = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
-
-    # limpieza leve
-    clean_k = max(3, int(border_px * 0.18))
-    kernel = make_ellipse_kernel(clean_k)
-    smooth = cv2.morphologyEx(smooth, cv2.MORPH_CLOSE, kernel, iterations=1)
-    smooth = cv2.morphologyEx(smooth, cv2.MORPH_OPEN, kernel, iterations=1)
-
-    return smooth
 
 
 def fill_small_inner_holes(mask: np.ndarray, max_hole_area: int = 4200) -> np.ndarray:
@@ -311,12 +221,10 @@ def fill_small_inner_holes(mask: np.ndarray, max_hole_area: int = 4200) -> np.nd
     return solid
 
 
-def make_sticker_mask(alpha_mask: np.ndarray) -> np.ndarray:
+def make_cutline_base(alpha_mask: np.ndarray) -> np.ndarray:
     """
-    Pipeline final:
-    - agrupa componentes
-    - fusiona por cluster
-    - genera borde orgánico por distance transform + metaball suave
+    Construye la base uniendo piezas SIN usar approxPolyDP, 
+    para mantener las curvas naturales originales.
     """
     h, w = alpha_mask.shape
     max_dim = max(h, w)
@@ -324,23 +232,56 @@ def make_sticker_mask(alpha_mask: np.ndarray) -> np.ndarray:
     comps, labels = get_components(alpha_mask, min_area=max(16, int(max_dim * 0.001)))
     clusters = cluster_components(comps, max_dim)
 
+    base = np.zeros_like(alpha_mask)
+
     if not clusters:
-        base = alpha_mask.copy()
-    else:
-        base = np.zeros_like(alpha_mask)
-        for cluster in clusters:
-            cluster_mask = cluster_mask_from_labels(labels, cluster)
-            cluster_mask = merge_cluster_shape(cluster_mask, max_dim)
-            base = cv2.bitwise_or(base, cluster_mask)
+        return alpha_mask
 
-    # grosor fijo que quieres mantener
+    for cluster in clusters:
+        cluster_mask = merge_cluster_mask(labels, cluster)
+
+        # Cerrar huecos dentro del cluster para que sea una masa sólida
+        bridge_size = max(5, int(max_dim * 0.015))
+        bridge_kernel = make_ellipse_kernel(bridge_size)
+        cluster_mask = cv2.morphologyEx(cluster_mask, cv2.MORPH_CLOSE, bridge_kernel, iterations=1)
+
+        # Nos quedamos con el contorno exterior puro, sin simplificar en polígonos
+        contours, _ = cv2.findContours(cluster_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(base, contours, -1, 255, thickness=cv2.FILLED)
+
+    return base
+
+
+def make_sticker_mask(alpha_mask: np.ndarray) -> np.ndarray:
+    """
+    Cutline final usando el efecto Blur + Threshold para un borde de "burbuja" perfecto.
+    """
+    h, w = alpha_mask.shape
+    max_dim = max(h, w)
+
+    cutline_base = make_cutline_base(alpha_mask)
+
+    # 1. Expandir para crear el margen (Offset)
     border_px = max(18, int(max_dim * 0.06))
+    border_kernel = make_ellipse_kernel(border_px)
+    dilated = cv2.dilate(cutline_base, border_kernel, iterations=1)
 
-    sticker = metaball_outline(base, border_px)
-    sticker = fill_small_inner_holes(sticker, max_hole_area=4200)
+    # 2. LA MAGIA: Blur Gaussiano + Threshold
+    # Esto elimina cualquier esquina afilada y suaviza las uniones como si fuera líquido
+    blur_size = max(15, int(border_px * 1.1)) # Modifica este 1.1 si quieres curvas aún más redondas
+    if blur_size % 2 == 0:
+        blur_size += 1
 
-    contours, _ = cv2.findContours(sticker, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    final_mask = np.zeros_like(sticker)
+    blurred = cv2.GaussianBlur(dilated, (blur_size, blur_size), 0)
+    
+    # Solidificamos de nuevo el borde desenfocado
+    _, shaped = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
+
+    # 3. Limpieza final
+    shaped = fill_small_inner_holes(shaped, max_hole_area=4200)
+
+    contours, _ = cv2.findContours(shaped, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    final_mask = np.zeros_like(shaped)
     cv2.drawContours(final_mask, contours, -1, 255, thickness=cv2.FILLED)
 
     return final_mask
@@ -414,7 +355,7 @@ def compose_final_preview(design_img: Image.Image, sticker_alpha: np.ndarray, ma
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": 30}
+    return {"ok": True, "version": 29}
 
 
 @app.post("/process-sticker")
@@ -429,6 +370,7 @@ async def process_sticker(
 
         clean_design = sanitize_design_rgba(design_trimmed)
         alpha_mask = build_alpha_mask(clean_design)
+
         sticker_alpha = make_sticker_mask(alpha_mask)
 
         contour_img = make_rgba_from_alpha(sticker_alpha, (255, 255, 255))
@@ -441,7 +383,10 @@ async def process_sticker(
             "debug_material": material,
             "debug_texture_found": texture_path is not None,
             "debug_texture_path": texture_path,
-            "debug_version": 30
+            "debug_version": 29
         })
     except Exception as e:
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": str(e)}
+        )
