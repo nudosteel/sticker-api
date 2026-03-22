@@ -1,4 +1,4 @@
-# VERSION 14 - Final composed preview
+# VERSION 15 - Holographic as full sticker material
 
 from io import BytesIO
 import base64
@@ -103,10 +103,11 @@ def find_texture(filename: str) -> Path | None:
 
 
 def load_texture(material: str, size: tuple[int, int]):
-    if material != "holographic":
-        return None, None
+    if material == "holographic":
+        path = find_texture("holographic.png")
+    else:
+        path = None
 
-    path = find_texture("holographic.png")
     if path is None:
         return None, None
 
@@ -115,39 +116,11 @@ def load_texture(material: str, size: tuple[int, int]):
     return tex, str(path)
 
 
-def make_white_area_mask(contour_img: Image.Image, design_img: Image.Image) -> Image.Image:
-    """
-    Material sobre toda la zona blanca:
-    contour - design dilatado
-    El margen se calcula automático según tamaño.
-    """
-    contour_alpha = np.array(contour_img)[:, :, 3]
-    design_alpha = np.array(design_img)[:, :, 3]
-
-    design_solid = np.where(design_alpha > 0, 255, 0).astype(np.uint8)
-
-    h, w = contour_alpha.shape
-    keepout_px = max(4, int(max(h, w) * 0.012))
-    if keepout_px % 2 != 0:
-        keepout_px += 1
-
-    kernel = np.ones((keepout_px, keepout_px), np.uint8)
-    design_keepout = cv2.dilate(design_solid, kernel, iterations=1)
-
-    white_area = cv2.subtract(contour_alpha, design_keepout)
-
-    out = np.zeros((h, w, 4), dtype=np.uint8)
-    out[:, :, 0:3] = 255
-    out[:, :, 3] = white_area
-    return Image.fromarray(out, "RGBA")
-
-
-def apply_mask_to_texture(texture: Image.Image, mask_img: Image.Image) -> Image.Image:
-    tex = texture.copy().convert("RGBA")
-    mask_alpha = np.array(mask_img)[:, :, 3]
-    tex_arr = np.array(tex)
-    tex_arr[:, :, 3] = mask_alpha
-    return Image.fromarray(tex_arr, "RGBA")
+def mask_image_to_alpha(img: Image.Image, alpha_source: Image.Image) -> Image.Image:
+    arr = np.array(img.convert("RGBA"))
+    alpha = np.array(alpha_source.convert("RGBA"))[:, :, 3]
+    arr[:, :, 3] = alpha
+    return Image.fromarray(arr, "RGBA")
 
 
 def make_white_base(contour_img: Image.Image) -> Image.Image:
@@ -160,18 +133,21 @@ def make_white_base(contour_img: Image.Image) -> Image.Image:
 
 
 def compose_final_preview(design_img: Image.Image, contour_img: Image.Image, material: str):
+    texture_path = None
     canvas = Image.new("RGBA", design_img.size, (0, 0, 0, 0))
 
-    white_base = make_white_base(contour_img)
-    canvas.alpha_composite(white_base)
+    if material == "holographic":
+        texture, texture_path = load_texture(material, design_img.size)
 
-    texture_path = None
-    texture, texture_path = load_texture(material, design_img.size)
-
-    if texture is not None:
-        white_area_mask = make_white_area_mask(contour_img, design_img)
-        textured = apply_mask_to_texture(texture, white_area_mask)
-        canvas.alpha_composite(textured)
+        if texture is not None:
+            holo_base = mask_image_to_alpha(texture, contour_img)
+            canvas.alpha_composite(holo_base)
+        else:
+            white_base = make_white_base(contour_img)
+            canvas.alpha_composite(white_base)
+    else:
+        white_base = make_white_base(contour_img)
+        canvas.alpha_composite(white_base)
 
     canvas.alpha_composite(design_img)
     return canvas, texture_path
@@ -179,7 +155,7 @@ def compose_final_preview(design_img: Image.Image, contour_img: Image.Image, mat
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": 14}
+    return {"ok": True, "version": 15}
 
 
 @app.post("/process-sticker")
@@ -203,7 +179,7 @@ async def process_sticker(
             "debug_material": material,
             "debug_texture_found": texture_path is not None,
             "debug_texture_path": texture_path,
-            "debug_version": 14
+            "debug_version": 15
         })
     except Exception as e:
         return JSONResponse(
