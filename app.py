@@ -1,4 +1,4 @@
-# VERSION 35.1 - Improved Borders (StickerApp-quality)
+# VERSION 35.2 - Smooth Borders + SA Shadow
 # Changes from v35.0:
 #   - Tighter border: default ratio 0.05 → 0.028, matching StickerApp look
 #   - Reduced canvas padding: 0.14 → 0.08, less wasted white space
@@ -381,35 +381,44 @@ def smooth_contour_spline(contour: np.ndarray, num_points: int = 300, smoothing:
             pass  # fall through to Chaikin
 
     # --- Method 2: Chaikin corner cutting (no dependencies) ---
-    # 4 iterations ≈ cubic spline quality for sticker outlines
-    smooth_pts = chaikin_smooth(pts, iterations=4).astype(np.int32)
+    # 5 iterations for extra smooth curves (each iteration doubles points)
+    smooth_pts = chaikin_smooth(pts, iterations=5).astype(np.int32)
     return smooth_pts.reshape(-1, 1, 2)
 
 
 def metaball_outline(mask: np.ndarray, border_px: int) -> np.ndarray:
     """
-    v35.1: Tighter outline generation.
-    - Smaller blur kernel (0.3x border instead of 0.55x) → hugs the design closer
-    - Lower threshold (110 instead of 127) → less rounding at concavities
-    - Minimal morphology cleanup to avoid inflating the shape
+    v35.2: Tighter outline + anti-alias pre-smoothing.
+    - Distance transform expansion for uniform border width
+    - Two-pass Gaussian: first a tight pass for shape (0.30x), then a
+      final anti-alias pass to eliminate pixel staircase before contour extraction
+    - Lower threshold preserves concavities between letters
     """
     inv = 255 - mask
     dist = cv2.distanceTransform(inv, cv2.DIST_L2, 5)
     expanded = np.where(dist <= border_px, 255, 0).astype(np.uint8)
 
-    # SMALLER blur → tighter to the original shape
+    # shape blur — tight, preserves concavities
     blur = max(3, int(border_px * 0.30))
     if blur % 2 == 0:
         blur += 1
     blurred = cv2.GaussianBlur(expanded, (blur, blur), 0)
-
-    # lower threshold → preserves concavities (between letters, etc.)
     _, smooth = cv2.threshold(blurred, 110, 255, cv2.THRESH_BINARY)
 
-    # minimal cleanup — just close tiny gaps, don't inflate
+    # close tiny gaps
     clean_k = max(3, int(border_px * 0.12))
     kernel = make_ellipse_kernel(clean_k)
     smooth = cv2.morphologyEx(smooth, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    # ANTI-ALIAS PASS: blur the binary mask edge and re-threshold.
+    # This converts the pixel staircase into a smooth gradient edge,
+    # so findContours extracts a clean curve instead of jagged pixels.
+    aa_blur = max(5, int(border_px * 0.40))
+    if aa_blur % 2 == 0:
+        aa_blur += 1
+    aa = cv2.GaussianBlur(smooth, (aa_blur, aa_blur), 0)
+    _, smooth = cv2.threshold(aa, 127, 255, cv2.THRESH_BINARY)
+
     return smooth
 
 
@@ -453,8 +462,8 @@ def make_sticker_mask(alpha_mask: np.ndarray, border_ratio: float = 0.028) -> np
     sticker = metaball_outline(base, border_px)
     sticker = fill_small_inner_holes(sticker, max_hole_area=4200)
 
-    # extract contours and smooth them with cubic splines
-    contours, _ = cv2.findContours(sticker, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # extract contours with ALL points (NONE, not SIMPLE) for smoother spline input
+    contours, _ = cv2.findContours(sticker, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
 
     final_mask = np.zeros_like(sticker)
     for cnt in contours:
@@ -536,16 +545,47 @@ def apply_alpha_mask(img: Image.Image, alpha_mask: np.ndarray) -> Image.Image:
 
 
 def create_shadow_from_mask(
-    mask: np.ndarray, blur_radius: int = 15, opacity: int = 15, offset=(0, 11)
+    mask: np.ndarray,
+    blur_radius: int = 28,
+    opacity: int = 55,
+    offset: tuple[int, int] = (4, 8),
 ) -> Image.Image:
+    """
+    v35.2: StickerApp-style shadow.
+    - Higher opacity (55 vs 15) for visible depth
+    - Larger blur radius (28 vs 15) for soft diffuse spread
+    - Offset slightly right + down (4, 8) matching SA's lighting angle
+    - Uses the mask's actual alpha as shadow shape (not flat opacity)
+    """
     h, w = mask.shape
-    alpha = Image.fromarray(mask, "L")
-    shadow_alpha = alpha.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-    shadow_rgba = Image.new("RGBA", (w, h), (0, 0, 0, opacity))
-    shadow_rgba.putalpha(shadow_alpha)
-    base = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    base.alpha_composite(shadow_rgba, dest=offset)
-    return base
+
+    # expand canvas to accommodate shadow offset without clipping
+    pad_x = abs(offset[0]) + blur_radius
+    pad_y = abs(offset[1]) + blur_radius
+    canvas_w = w + pad_x * 2
+    canvas_h = h + pad_y * 2
+
+    # place mask centered in padded canvas
+    padded_mask = Image.new("L", (canvas_w, canvas_h), 0)
+    padded_mask.paste(Image.fromarray(mask, "L"), (pad_x, pad_y))
+
+    # blur to create soft shadow spread
+    shadow_alpha = padded_mask.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    # scale alpha to target opacity
+    sa = np.array(shadow_alpha).astype(np.float32)
+    sa = sa * (opacity / 255.0)
+    shadow_alpha = Image.fromarray(np.clip(sa, 0, 255).astype(np.uint8), "L")
+
+    # build shadow RGBA
+    shadow_rgba = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    shadow_color = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 255))
+    shadow_color.putalpha(shadow_alpha)
+    shadow_rgba.alpha_composite(shadow_color, dest=offset)
+
+    # crop back to original size
+    result = shadow_rgba.crop((pad_x, pad_y, pad_x + w, pad_y + h))
+    return result
 
 
 def compose_final_preview(
@@ -558,8 +598,8 @@ def compose_final_preview(
     w, h = design_img.size
     canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
 
-    # shadow
-    shadow = create_shadow_from_mask(sticker_alpha, blur_radius=15, opacity=15, offset=(0, 11))
+    # shadow — SA-style: soft, visible, offset down-right
+    shadow = create_shadow_from_mask(sticker_alpha, blur_radius=28, opacity=55, offset=(4, 8))
     canvas.alpha_composite(shadow)
 
     # material base
@@ -669,7 +709,7 @@ def run_heavy_pipeline(
 # ─────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"ok": True, "version": "35.1"}
+    return {"ok": True, "version": "35.2"}
 
 
 @app.get("/cache-stats")
@@ -714,7 +754,7 @@ async def process_sticker(
             "cache_key": heavy["fhash"],
             "border_ratio": border_ratio,
             "material": material,
-            "debug_version": "35.1",
+            "debug_version": "35.2",
             "debug_cache_hit": heavy["cache_hit"],
             "debug_texture_found": texture_path is not None,
             "debug_bg_method": heavy["bg_method"],
@@ -763,7 +803,7 @@ async def recompose(
             "cache_key": cache_key,
             "border_ratio": border_ratio,
             "material": material,
-            "debug_version": "35.1",
+            "debug_version": "35.2",
             "debug_cache_hit": True,
             "debug_texture_found": texture_path is not None,
         })
