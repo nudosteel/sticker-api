@@ -1,8 +1,9 @@
-# VERSION 27 - Alpha-driven contour + dirty edge cleanup
+# VERSION 28 - Geometric cutline: outer contour + simplify + round + offset
 
 from io import BytesIO
 import base64
 from pathlib import Path
+import math
 
 import cv2
 import numpy as np
@@ -65,18 +66,37 @@ def make_ellipse_kernel(size: int) -> np.ndarray:
     return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
 
 
+def sanitize_design_rgba(design_trimmed: Image.Image) -> Image.Image:
+    """
+    Limpia halos o colores basura en bordes semitransparentes.
+    """
+    arr = np.array(design_trimmed).astype(np.uint8)
+    alpha = arr[:, :, 3].astype(np.float32) / 255.0
+    rgb = arr[:, :, :3].astype(np.float32)
+
+    very_low = arr[:, :, 3] < 12
+    rgb[very_low] = 0
+
+    semi = (arr[:, :, 3] >= 12) & (arr[:, :, 3] < 245)
+    if np.any(semi):
+        a = alpha[semi][:, None]
+        rgb[semi] = rgb[semi] * a + 255.0 * (1.0 - a)
+
+    arr[:, :, :3] = np.clip(rgb, 0, 255).astype(np.uint8)
+    return Image.fromarray(arr, "RGBA")
+
+
 def build_alpha_mask(design_img: Image.Image) -> np.ndarray:
     """
-    Usa SOLO alpha.
-    Así da igual si el arte es negro, naranja o cualquier color.
+    Usa SOLO alpha para la máscara base.
     """
     arr = np.array(design_img)
     alpha = arr[:, :, 3].astype(np.uint8)
 
-    # Umbral suave para conservar bordes más naturales
+    # Umbral bajo para respetar bordes anti-aliased
     mask = np.where(alpha >= 8, 255, 0).astype(np.uint8)
 
-    # Cerrar huecos internos pequeños del alpha
+    # Rellenar huecos internos pequeños del arte
     inv = 255 - mask
     num, labels, stats, _ = cv2.connectedComponentsWithStats(inv, 8)
 
@@ -94,6 +114,132 @@ def build_alpha_mask(design_img: Image.Image) -> np.ndarray:
             mask[labels == i] = 255
 
     return mask
+
+
+def get_components(mask: np.ndarray, min_area: int = 16):
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    comps = []
+
+    for i in range(1, num):
+        x = stats[i, cv2.CC_STAT_LEFT]
+        y = stats[i, cv2.CC_STAT_TOP]
+        w = stats[i, cv2.CC_STAT_WIDTH]
+        h = stats[i, cv2.CC_STAT_HEIGHT]
+        area = stats[i, cv2.CC_STAT_AREA]
+
+        if area < min_area:
+            continue
+
+        comps.append({
+            "id": i,
+            "x1": x,
+            "y1": y,
+            "x2": x + w - 1,
+            "y2": y + h - 1,
+            "w": w,
+            "h": h,
+            "area": area,
+            "cx": x + w / 2.0,
+            "cy": y + h / 2.0,
+        })
+
+    return comps, labels
+
+
+def bbox_gap(a, b):
+    dx = max(0, max(a["x1"], b["x1"]) - min(a["x2"], b["x2"]))
+    dy = max(0, max(a["y1"], b["y1"]) - min(a["y2"], b["y2"]))
+    return dx, dy, math.hypot(dx, dy)
+
+
+class DSU:
+    def __init__(self, n):
+        self.p = list(range(n))
+
+    def find(self, x):
+        while self.p[x] != x:
+            self.p[x] = self.p[self.p[x]]
+            x = self.p[x]
+        return x
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.p[rb] = ra
+
+
+def cluster_components(components, max_dim):
+    """
+    Une piezas cercanas de forma geométrica.
+    Sirve para:
+    - icono + texto
+    - textos en 2 líneas
+    - letras cercanas
+    """
+    if not components:
+        return []
+
+    dsu = DSU(len(components))
+
+    horizontal_gap = max(12, int(max_dim * 0.05))
+    vertical_gap = max(10, int(max_dim * 0.04))
+    diag_gap = max(14, int(max_dim * 0.055))
+
+    for i in range(len(components)):
+        for j in range(i + 1, len(components)):
+            a = components[i]
+            b = components[j]
+
+            dx, dy, dist = bbox_gap(a, b)
+
+            same_row_like = dy <= vertical_gap
+            stacked_like = dx <= horizontal_gap
+            near_enough = dist <= diag_gap
+
+            if same_row_like or stacked_like or near_enough:
+                dsu.union(i, j)
+
+    groups = {}
+    for idx, comp in enumerate(components):
+        root = dsu.find(idx)
+        groups.setdefault(root, []).append(comp)
+
+    return list(groups.values())
+
+
+def merge_cluster_mask(labels: np.ndarray, cluster) -> np.ndarray:
+    mask = np.zeros(labels.shape, dtype=np.uint8)
+    ids = [c["id"] for c in cluster]
+    mask[np.isin(labels, ids)] = 255
+    return mask
+
+
+def simplify_and_round_outer(mask: np.ndarray, max_dim: int) -> np.ndarray:
+    """
+    Convierte la silueta raster en una forma exterior más limpia:
+    - solo contorno exterior
+    - simplificación geométrica
+    - redondeo leve
+    """
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = np.zeros_like(mask)
+
+    for cnt in contours:
+        peri = cv2.arcLength(cnt, True)
+
+        # simplificación leve del contorno
+        epsilon = max(1.2, 0.004 * peri)
+        approx = cv2.approxPolyDP(cnt, epsilon, True)
+
+        cv2.drawContours(out, [approx], -1, 255, thickness=cv2.FILLED)
+
+    # redondeo estructural leve
+    round_size = max(5, int(max_dim * 0.012))
+    round_kernel = make_ellipse_kernel(round_size)
+    out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, round_kernel, iterations=1)
+    out = cv2.morphologyEx(out, cv2.MORPH_OPEN, round_kernel, iterations=1)
+
+    return out
 
 
 def fill_small_inner_holes(mask: np.ndarray, max_hole_area: int = 4200) -> np.ndarray:
@@ -118,58 +264,57 @@ def fill_small_inner_holes(mask: np.ndarray, max_hole_area: int = 4200) -> np.nd
     return solid
 
 
-def sanitize_design_rgba(design_trimmed: Image.Image) -> Image.Image:
+def make_cutline_base(alpha_mask: np.ndarray) -> np.ndarray:
     """
-    Limpia halos o tonos raros en bordes semitransparentes.
+    Construye la base geométrica de la cutline antes del offset.
     """
-    arr = np.array(design_trimmed).astype(np.uint8)
-    alpha = arr[:, :, 3].astype(np.float32) / 255.0
-    rgb = arr[:, :, :3].astype(np.float32)
-
-    # Muy bajo alpha: limpiar totalmente
-    very_low = arr[:, :, 3] < 12
-    rgb[very_low] = 0
-
-    # Semitransparencias: neutralizar suciedad de color
-    semi = (arr[:, :, 3] >= 12) & (arr[:, :, 3] < 245)
-    if np.any(semi):
-        a = alpha[semi][:, None]
-        rgb[semi] = rgb[semi] * a + 255.0 * (1.0 - a)
-
-    arr[:, :, :3] = np.clip(rgb, 0, 255).astype(np.uint8)
-    return Image.fromarray(arr, "RGBA")
-
-
-def merge_nearby_components(mask: np.ndarray) -> np.ndarray:
-    """
-    Une piezas cercanas sin depender del color.
-    """
-    h, w = mask.shape
+    h, w = alpha_mask.shape
     max_dim = max(h, w)
 
-    bridge_px = max(7, int(max_dim * 0.02))
-    bridge_kernel = make_ellipse_kernel(bridge_px)
+    comps, labels = get_components(alpha_mask, min_area=max(16, int(max_dim * 0.001)))
+    clusters = cluster_components(comps, max_dim)
 
-    merged = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, bridge_kernel, iterations=1)
-    return merged
+    base = np.zeros_like(alpha_mask)
+
+    if not clusters:
+        return alpha_mask
+
+    for cluster in clusters:
+        cluster_mask = merge_cluster_mask(labels, cluster)
+
+        # unir piezas del cluster sin deformar demasiado
+        bridge_size = max(5, int(max_dim * 0.015))
+        bridge_kernel = make_ellipse_kernel(bridge_size)
+        cluster_mask = cv2.morphologyEx(cluster_mask, cv2.MORPH_CLOSE, bridge_kernel, iterations=1)
+
+        # quedarnos con silueta exterior limpia
+        cluster_mask = simplify_and_round_outer(cluster_mask, max_dim)
+
+        base = cv2.bitwise_or(base, cluster_mask)
+
+    return base
 
 
 def make_sticker_mask(alpha_mask: np.ndarray) -> np.ndarray:
     """
-    Contorno final basado en alpha.
+    Cutline final:
+    - base geométrica
+    - offset fijo
+    - redondeo final leve
     """
     h, w = alpha_mask.shape
+    max_dim = max(h, w)
 
-    merged = merge_nearby_components(alpha_mask)
+    cutline_base = make_cutline_base(alpha_mask)
 
     # GROSOR FIJO QUE QUIERES MANTENER
-    border_px = max(18, int(max(h, w) * 0.06))
+    border_px = max(18, int(max_dim * 0.06))
     border_kernel = make_ellipse_kernel(border_px)
-    dilated = cv2.dilate(merged, border_kernel, iterations=1)
+    dilated = cv2.dilate(cutline_base, border_kernel, iterations=1)
 
-    round_size = max(7, border_px // 2)
+    # redondeo final del offset
+    round_size = max(7, int(border_px * 0.45))
     round_kernel = make_ellipse_kernel(round_size)
-
     shaped = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, round_kernel, iterations=1)
     shaped = cv2.morphologyEx(shaped, cv2.MORPH_OPEN, round_kernel, iterations=1)
 
@@ -250,7 +395,7 @@ def compose_final_preview(design_img: Image.Image, sticker_alpha: np.ndarray, ma
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": 27}
+    return {"ok": True, "version": 28}
 
 
 @app.post("/process-sticker")
@@ -278,7 +423,7 @@ async def process_sticker(
             "debug_material": material,
             "debug_texture_found": texture_path is not None,
             "debug_texture_path": texture_path,
-            "debug_version": 27
+            "debug_version": 28
         })
     except Exception as e:
         return JSONResponse(
