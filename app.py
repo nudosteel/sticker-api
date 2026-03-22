@@ -1,4 +1,4 @@
-# VERSION 34.3 - Auto remove background for JPG/opaque PNG + existing contour/shadow flow
+# VERSION 34.4 - Better JPG logo extraction on light backgrounds + contour/shadow
 
 from io import BytesIO
 import base64
@@ -48,13 +48,6 @@ def remove_background_with_rembg(img: Image.Image) -> Image.Image:
     img.convert("RGBA").save(buf, format="PNG")
     out = remove(buf.getvalue())
     return Image.open(BytesIO(out)).convert("RGBA")
-
-
-def prepare_input_image(img: Image.Image) -> Image.Image:
-    img = img.convert("RGBA")
-    if has_useful_alpha(img):
-        return img
-    return remove_background_with_rembg(img)
 
 
 def trim_transparent(img: Image.Image, padding_ratio: float = 0.08) -> Image.Image:
@@ -121,6 +114,78 @@ def build_alpha_mask(design_img: Image.Image) -> np.ndarray:
     arr = np.array(design_img)
     alpha = arr[:, :, 3].astype(np.uint8)
     return np.where(alpha >= 8, 255, 0).astype(np.uint8)
+
+
+def extract_logo_from_light_background(img: Image.Image) -> Image.Image:
+    """
+    Para JPG/PNG opacos con logo sobre fondo claro.
+    Elimina blancos, grises muy claros y sombras suaves.
+    Conserva negros y colores.
+    """
+    rgba = img.convert("RGBA")
+    arr = np.array(rgba)
+    rgb = arr[:, :, :3]
+
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+
+    # foreground si no es fondo claro
+    # conserva:
+    # - píxeles oscuros
+    # - píxeles saturados/coloreados
+    fg = ((val < 245) | (sat > 25)).astype(np.uint8) * 255
+
+    # quita ruido pequeño
+    k1 = make_ellipse_kernel(3)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, k1, iterations=1)
+
+    # une ligeramente trazos
+    k2 = make_ellipse_kernel(5)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, k2, iterations=1)
+
+    # quedarnos solo con componentes relevantes
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(fg, 8)
+    clean = np.zeros_like(fg)
+    h, w = fg.shape
+    min_area = max(40, int((h * w) * 0.0005))
+
+    for i in range(1, num):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area >= min_area:
+            clean[labels == i] = 255
+
+    # suavizado ligero del alpha
+    alpha = Image.fromarray(clean, "L").filter(ImageFilter.GaussianBlur(radius=1))
+    alpha_np = np.array(alpha)
+    alpha_np = np.where(alpha_np > 18, alpha_np, 0).astype(np.uint8)
+
+    out = np.array(rgba)
+    out[:, :, 3] = alpha_np
+    return Image.fromarray(out, "RGBA")
+
+
+def prepare_input_image(img: Image.Image) -> tuple[Image.Image, str]:
+    """
+    1) Si ya tiene alpha útil, respetarlo.
+    2) Si no, probar extracción de logo sobre fondo claro.
+    3) Si eso no sirve, caer a rembg.
+    """
+    img = img.convert("RGBA")
+
+    if has_useful_alpha(img):
+        return img, "alpha"
+
+    light_bg = extract_logo_from_light_background(img)
+    light_alpha = np.array(light_bg)[:, :, 3]
+    coverage = float(np.count_nonzero(light_alpha)) / float(light_alpha.size)
+
+    # si detectamos algo razonable, usarlo
+    if 0.001 < coverage < 0.55:
+        return light_bg, "light_bg"
+
+    rembg_img = remove_background_with_rembg(img)
+    return rembg_img, "rembg"
 
 
 def get_components(mask: np.ndarray, min_area: int = 16):
@@ -335,7 +400,7 @@ def apply_alpha_mask(img: Image.Image, alpha_mask: np.ndarray) -> Image.Image:
     return Image.fromarray(arr, "RGBA")
 
 
-def create_shadow_from_mask(mask: np.ndarray, blur_radius: int = 14, opacity: int = 30, offset=(0, 14)) -> Image.Image:
+def create_shadow_from_mask(mask: np.ndarray, blur_radius: int = 18, opacity: int = 70, offset=(0, 14)) -> Image.Image:
     h, w = mask.shape
     alpha = Image.fromarray(mask, "L")
 
@@ -373,7 +438,7 @@ def compose_final_preview(design_img: Image.Image, sticker_alpha: np.ndarray, ma
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": "34.3"}
+    return {"ok": True, "version": "34.4"}
 
 
 @app.post("/process-sticker")
@@ -382,7 +447,7 @@ async def process_sticker(file: UploadFile = File(...), material: str = Form("vi
         data = await file.read()
         raw_img = load_rgba_from_bytes(data)
 
-        prepared_img = prepare_input_image(raw_img)
+        prepared_img, bg_method = prepare_input_image(raw_img)
         design_trimmed = trim_transparent(prepared_img, padding_ratio=0.08)
         clean_design = sanitize_design_rgba(design_trimmed)
         padded_design = add_canvas_padding(clean_design, padding_ratio=0.14, min_px=70)
@@ -395,10 +460,10 @@ async def process_sticker(file: UploadFile = File(...), material: str = Form("vi
         return JSONResponse({
             "ok": True,
             "final_preview_png": to_base64(final_preview),
-            "debug_version": "34.3",
+            "debug_version": "34.4",
             "debug_texture_found": texture_path is not None,
             "debug_texture_path": texture_path,
-            "debug_bg_removed": not has_useful_alpha(raw_img.convert("RGBA"))
+            "debug_bg_method": bg_method
         })
     except Exception as e:
         return JSONResponse(
