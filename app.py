@@ -1,4 +1,4 @@
-# VERSION 19 - Stronger inner-hole fix without breaking contour
+# VERSION 21 - Rounded StickerApp-like contour
 
 from io import BytesIO
 import base64
@@ -82,53 +82,46 @@ def clean_design_alpha(design_img: Image.Image, max_hole_area: int = 10000) -> n
     return solid
 
 
-def fill_small_inner_holes(mask: np.ndarray, max_hole_area: int = 8000) -> np.ndarray:
-    """
-    Rellena solo huecos internos pequeños de la máscara del sticker.
-    Los huecos conectados al borde exterior se conservan.
-    """
-    solid = mask.copy()
-    inv = 255 - solid
+def make_ellipse_kernel(size: int) -> np.ndarray:
+    if size % 2 == 0:
+        size += 1
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
 
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(inv, 8)
 
-    h, w = solid.shape
-    border = set()
-    border.update(np.unique(labels[0, :]).tolist())
-    border.update(np.unique(labels[h - 1, :]).tolist())
-    border.update(np.unique(labels[:, 0]).tolist())
-    border.update(np.unique(labels[:, w - 1]).tolist())
-
-    for i in range(1, num):
-        if i in border:
-            continue
-        if stats[i, cv2.CC_STAT_AREA] <= max_hole_area:
-            solid[labels == i] = 255
-
-    return solid
+def smooth_mask(mask: np.ndarray, blur_size: int = 5) -> np.ndarray:
+    if blur_size % 2 == 0:
+        blur_size += 1
+    blurred = cv2.GaussianBlur(mask, (blur_size, blur_size), 0)
+    _, th = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
+    return th
 
 
 def make_sticker_mask(design_alpha: np.ndarray) -> np.ndarray:
     """
-    Crea el borde real del sticker dilatando el diseño.
-    VERSION 19: mismo grosor + cierre suave + relleno de huecos internos.
+    Crea una silueta exterior más orgánica:
+    - dilata con kernel elíptico
+    - cierre suave
+    - toma solo contornos exteriores
+    - rellena
+    - suaviza ligeramente
     """
     h, w = design_alpha.shape
 
-    border_px = max(19, int(max(h, w) * 0.085))
-    if border_px % 2 != 0:
-        border_px += 1
+    border_px = max(18, int(max(h, w) * 0.06))
 
-    kernel = np.ones((border_px, border_px), np.uint8)
-    dilated = cv2.dilate(design_alpha, kernel, iterations=1)
+    dilate_kernel = make_ellipse_kernel(border_px)
+    dilated = cv2.dilate(design_alpha, dilate_kernel, iterations=1)
 
-    # Cierre suave para unir micro-cortes o cortes internos accidentales
-    close_kernel = np.ones((6, 6), np.uint8)
+    close_kernel = make_ellipse_kernel(max(5, border_px // 3))
     closed = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, close_kernel, iterations=1)
 
-    # Rellenar solo huecos internos pequeños
-    cleaned = fill_small_inner_holes(closed, max_hole_area=4200)
-    return cleaned
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    mask = np.zeros_like(closed)
+    cv2.drawContours(mask, contours, -1, 255, thickness=cv2.FILLED)
+
+    mask = smooth_mask(mask, blur_size=5)
+    return mask
 
 
 def make_rgba_from_alpha(alpha: np.ndarray, rgb=(255, 255, 255)) -> Image.Image:
@@ -193,14 +186,13 @@ def compose_final_preview(design_img: Image.Image, sticker_alpha: np.ndarray, ma
         white_base = make_rgba_from_alpha(sticker_alpha, (255, 255, 255))
         canvas.alpha_composite(white_base)
 
-    # Diseño negro arriba
     canvas.alpha_composite(design_img)
     return canvas, texture_path
 
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": 19}
+    return {"ok": True, "version": 21}
 
 
 @app.post("/process-sticker")
@@ -214,6 +206,7 @@ async def process_sticker(
         design_trimmed = trim_transparent(raw_img, padding_ratio=0.08)
 
         design_alpha = clean_design_alpha(design_trimmed, max_hole_area=10000)
+
         design_arr = np.array(design_trimmed)
         design_arr[:, :, 3] = design_alpha
         design_img = Image.fromarray(design_arr, "RGBA")
@@ -230,7 +223,7 @@ async def process_sticker(
             "debug_material": material,
             "debug_texture_found": texture_path is not None,
             "debug_texture_path": texture_path,
-            "debug_version": 19
+            "debug_version": 21
         })
     except Exception as e:
         return JSONResponse(
