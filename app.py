@@ -1,4 +1,4 @@
-# VERSION 31.1 - Debug masks + error trace visible
+# VERSION 31.2 - Debug masks + transparent debug PNGs
 
 from io import BytesIO
 import base64
@@ -33,8 +33,11 @@ def to_base64(img: Image.Image) -> str:
 
 
 def mask_to_base64(mask: np.ndarray) -> str:
-    img = Image.fromarray(mask, "L")
-    return to_base64(img.convert("RGBA"))
+    h, w = mask.shape
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    rgba[:, :, 3] = mask
+    img = Image.fromarray(rgba, "RGBA")
+    return to_base64(img)
 
 
 def load_rgba_from_bytes(data: bytes) -> Image.Image:
@@ -330,7 +333,7 @@ def compose_final_preview(design_img: Image.Image, sticker_alpha: np.ndarray, ma
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": "31.1"}
+    return {"ok": True, "version": "31.2"}
 
 
 @app.post("/process-sticker")
@@ -354,7 +357,7 @@ async def process_sticker(file: UploadFile = File(...), material: str = Form("vi
             "debug_sticker_mask_png": mask_to_base64(sticker_alpha),
             "debug_texture_found": texture_path is not None,
             "debug_texture_path": texture_path,
-            "debug_version": "31.1"
+            "debug_version": "31.2"
         })
     except Exception as e:
         return JSONResponse(
