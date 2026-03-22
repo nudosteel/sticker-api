@@ -1,7 +1,11 @@
-# VERSION 35.5 - Shapes + Save Design + Webhook (Order Paid → PDF + Email)
-# Changes from v35.4:
-#   - fit_design_in_shape() now integrated into /process-sticker, /recompose, and /webhook/order-paid
-#   - Design is scaled down (~60% of canvas) and centered for geometric shapes
+# VERSION 36.0 - Geometric shapes fully fixed
+# Changes from v35.x:
+#   - NEW: apply_geometric_shape() — single function handles everything:
+#     1. Pads canvas to SQUARE so circles never get clipped on wide/tall designs
+#     2. Scales design down (~55% fill) and centers it on the square canvas
+#     3. Draws the geometric mask (circle, oval, square, rounded) on the square canvas
+#   - Replaces old make_shape_mask() + fit_design_in_shape() which didn't work
+#   - Integrated into /process-sticker, /recompose, and /webhook/order-paid
 # Changes from v35.2:
 #   - Shape support: circle, square, oval, rounded, contour-cut
 #   - /save-design endpoint: saves design to disk for post-payment processing
@@ -452,76 +456,136 @@ def make_sticker_mask(alpha_mask: np.ndarray, border_ratio: float = 0.028) -> np
     return final_mask
 
 
-def make_shape_mask(alpha_mask: np.ndarray, shape: str, border_ratio: float = 0.028) -> np.ndarray:
+def apply_geometric_shape(
+    design_img: Image.Image,
+    alpha_mask: np.ndarray,
+    shape: str,
+    border_ratio: float = 0.028,
+) -> tuple[Image.Image, np.ndarray]:
     """
-    Generates a geometric sticker mask (circle, square, oval, rounded).
-    The shape is centered on the canvas center with a fixed size based on the
-    design bounding box, ensuring the design fits inside with breathing room.
-    For contour-cut, delegates to make_sticker_mask().
+    All-in-one handler for geometric shapes (circle, square, oval, rounded).
+    1. Pads the canvas to a SQUARE so circles/ovals never get clipped.
+    2. Scales + centers the design content inside the square canvas (~55% fill).
+    3. Draws the geometric shape mask on that square canvas.
+    Returns (new_design_img, new_sticker_alpha) both on the square canvas.
+    For contour-cut, returns originals unchanged.
     """
     if shape == "contour-cut":
-        return make_sticker_mask(alpha_mask, border_ratio)
+        sticker_alpha = make_sticker_mask(alpha_mask, border_ratio)
+        return design_img, sticker_alpha
 
-    h, w = alpha_mask.shape
-    max_dim = max(h, w)
-    border_px = max(10, int(max_dim * border_ratio))
-    mask = np.zeros((h, w), dtype=np.uint8)
+    orig_w, orig_h = design_img.size
 
-    # canvas center — shape is always centered here
-    ccx = w // 2
-    ccy = h // 2
-
-    # find design bounding box
+    # --- Step 1: figure out the square canvas size ---
+    # Find the design bounding box
     ys, xs = np.where(alpha_mask > 0)
     if len(xs) == 0:
-        return mask
+        mask = np.zeros((orig_h, orig_w), dtype=np.uint8)
+        return design_img, mask
 
-    dw = int(xs.max()) - int(xs.min())
-    dh = int(ys.max()) - int(ys.min())
+    x1, x2 = int(xs.min()), int(xs.max())
+    y1, y2 = int(ys.min()), int(ys.max())
+    dw = x2 - x1 + 1
+    dh = y2 - y1 + 1
 
-    # the shape size is designed so the design (after scaling) occupies ~65%
-    # of the interior, leaving generous white space around it
-    # shape_radius = design_half_diagonal / fit_ratio + border
-    design_half = max(dw, dh) / 2
+    # The square canvas must be large enough to contain the shape with border.
+    # Design will occupy ~55% of the shape interior.
+    # Shape extends: design_half / 0.55 + border_px
+    design_diag = max(dw, dh)
+    border_px = max(10, int(design_diag * border_ratio))
 
     if shape == "circle":
-        # design must fit inside circle inscribed area: r * 0.65 = design_half
-        radius = int(design_half / 0.65 + border_px)
-        cv2.circle(mask, (ccx, ccy), radius, 255, -1)
+        # radius needed to contain design at 55% fill
+        radius = int((design_diag / 2) / 0.55 + border_px)
+        sq_size = radius * 2 + border_px * 4
+    elif shape == "oval":
+        ax_w = int((dw / 2) / 0.55 + border_px)
+        ax_h = int((dh / 2) / 0.55 + border_px)
+        min_ax = max(ax_w, ax_h)
+        ax_w = max(ax_w, int(min_ax * 0.65))
+        ax_h = max(ax_h, int(min_ax * 0.65))
+        sq_size = max(ax_w, ax_h) * 2 + border_px * 4
+    elif shape == "square":
+        half = int((design_diag / 2) / 0.55 + border_px)
+        sq_size = half * 2 + border_px * 4
+    elif shape == "rounded":
+        half_w = int((dw / 2) / 0.55 + border_px)
+        half_h = int((dh / 2) / 0.55 + border_px)
+        sq_size = max(half_w, half_h) * 2 + border_px * 4
+    else:
+        sticker_alpha = make_sticker_mask(alpha_mask, border_ratio)
+        return design_img, sticker_alpha
+
+    # ensure minimum size and make it even
+    sq_size = max(sq_size, max(orig_w, orig_h))
+    if sq_size % 2 != 0:
+        sq_size += 1
+
+    cx = sq_size // 2
+    cy = sq_size // 2
+
+    # --- Step 2: crop and scale the design content, center on square canvas ---
+    design_arr = np.array(design_img)
+    cropped = Image.fromarray(design_arr[y1:y2+1, x1:x2+1], "RGBA")
+
+    # design should occupy ~55% of the square canvas
+    target_area = sq_size * 0.55
+    scale = min(target_area / max(1, dw), target_area / max(1, dh))
+    scale = min(scale, 1.0)  # never upscale
+
+    new_dw = max(1, int(dw * scale))
+    new_dh = max(1, int(dh * scale))
+    cropped_scaled = cropped.resize((new_dw, new_dh), Image.Resampling.LANCZOS)
+
+    new_design = Image.new("RGBA", (sq_size, sq_size), (0, 0, 0, 0))
+    paste_x = (sq_size - new_dw) // 2
+    paste_y = (sq_size - new_dh) // 2
+    new_design.alpha_composite(cropped_scaled, dest=(paste_x, paste_y))
+
+    # --- Step 3: draw the geometric shape mask on the square canvas ---
+    mask = np.zeros((sq_size, sq_size), dtype=np.uint8)
+
+    if shape == "circle":
+        radius = int(max(new_dw, new_dh) / 2 / 0.75 + border_px)
+        # constrain to canvas
+        radius = min(radius, sq_size // 2 - 2)
+        cv2.circle(mask, (cx, cy), radius, 255, -1)
 
     elif shape == "oval":
-        # oval: each axis proportional to design + padding
-        ax_w = int((dw / 2) / 0.65 + border_px)
-        ax_h = int((dh / 2) / 0.65 + border_px)
-        # ensure minimum aspect ratio so it looks like an oval
+        ax_w = int((new_dw / 2) / 0.75 + border_px)
+        ax_h = int((new_dh / 2) / 0.75 + border_px)
+        # ensure minimum aspect ratio so it looks oval
         min_ax = max(ax_w, ax_h)
-        ax_w = max(ax_w, int(min_ax * 0.6))
-        ax_h = max(ax_h, int(min_ax * 0.6))
-        cv2.ellipse(mask, (ccx, ccy), (ax_w, ax_h), 0, 0, 360, 255, -1)
+        ax_w = max(ax_w, int(min_ax * 0.65))
+        ax_h = max(ax_h, int(min_ax * 0.65))
+        # constrain to canvas
+        ax_w = min(ax_w, sq_size // 2 - 2)
+        ax_h = min(ax_h, sq_size // 2 - 2)
+        cv2.ellipse(mask, (cx, cy), (ax_w, ax_h), 0, 0, 360, 255, -1)
 
     elif shape == "square":
-        half = int(design_half / 0.65 + border_px)
-        pt1 = (max(0, ccx - half), max(0, ccy - half))
-        pt2 = (min(w - 1, ccx + half), min(h - 1, ccy + half))
+        half = int(max(new_dw, new_dh) / 2 / 0.75 + border_px)
+        half = min(half, sq_size // 2 - 2)
+        pt1 = (cx - half, cy - half)
+        pt2 = (cx + half, cy + half)
         cv2.rectangle(mask, pt1, pt2, 255, -1)
 
     elif shape == "rounded":
-        half_w = int((dw / 2) / 0.65 + border_px)
-        half_h = int((dh / 2) / 0.65 + border_px)
+        half_w = int((new_dw / 2) / 0.75 + border_px)
+        half_h = int((new_dh / 2) / 0.75 + border_px)
+        half_w = min(half_w, sq_size // 2 - 2)
+        half_h = min(half_h, sq_size // 2 - 2)
         corner_r = max(8, int(min(half_w, half_h) * 0.25))
-        rx1 = max(0, ccx - half_w)
-        ry1 = max(0, ccy - half_h)
-        rx2 = min(w - 1, ccx + half_w)
-        ry2 = min(h - 1, ccy + half_h)
+        rx1 = cx - half_w
+        ry1 = cy - half_h
+        rx2 = cx + half_w
+        ry2 = cy + half_h
         cv2.rectangle(mask, (rx1 + corner_r, ry1), (rx2 - corner_r, ry2), 255, -1)
         cv2.rectangle(mask, (rx1, ry1 + corner_r), (rx2, ry2 - corner_r), 255, -1)
         cv2.circle(mask, (rx1 + corner_r, ry1 + corner_r), corner_r, 255, -1)
         cv2.circle(mask, (rx2 - corner_r, ry1 + corner_r), corner_r, 255, -1)
         cv2.circle(mask, (rx1 + corner_r, ry2 - corner_r), corner_r, 255, -1)
         cv2.circle(mask, (rx2 - corner_r, ry2 - corner_r), corner_r, 255, -1)
-
-    else:
-        return make_sticker_mask(alpha_mask, border_ratio)
 
     # anti-alias edges
     aa_blur = max(3, int(border_px * 0.15))
@@ -530,55 +594,7 @@ def make_shape_mask(alpha_mask: np.ndarray, shape: str, border_ratio: float = 0.
     mask = cv2.GaussianBlur(mask, (aa_blur, aa_blur), 0)
     _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
 
-    return mask
-
-
-def fit_design_in_shape(design_img: Image.Image, alpha_mask: np.ndarray, shape: str) -> Image.Image:
-    """
-    For geometric shapes: scales and centers the design so it fits
-    inside the shape with generous padding. Returns a new image
-    same size as design_img with the design centered and scaled down.
-    For contour-cut, returns the original design unchanged.
-    """
-    if shape == "contour-cut":
-        return design_img
-
-    w, h = design_img.size
-
-    # find design content bounding box
-    ys, xs = np.where(alpha_mask > 0)
-    if len(xs) == 0:
-        return design_img
-
-    x1, x2 = int(xs.min()), int(xs.max())
-    y1, y2 = int(ys.min()), int(ys.max())
-    dw = x2 - x1
-    dh = y2 - y1
-
-    # crop the design content
-    design_arr = np.array(design_img)
-    cropped = Image.fromarray(design_arr[y1:y2+1, x1:x2+1], "RGBA")
-
-    # scale factor: design should occupy ~60% of the canvas
-    # (the shape mask already has its own border, this ensures the design
-    # is well inside with visible white space on all sides)
-    scale = min((w * 0.60) / max(1, dw), (h * 0.60) / max(1, dh))
-    scale = min(scale, 1.0)  # never upscale
-
-    new_dw = int(dw * scale)
-    new_dh = int(dh * scale)
-    if new_dw < 1 or new_dh < 1:
-        return design_img
-
-    cropped_scaled = cropped.resize((new_dw, new_dh), Image.Resampling.LANCZOS)
-
-    # place centered on a fresh canvas
-    canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    paste_x = (w - new_dw) // 2
-    paste_y = (h - new_dh) // 2
-    canvas.alpha_composite(cropped_scaled, dest=(paste_x, paste_y))
-
-    return canvas
+    return new_design, mask
 
 
 # ─────────────────────────────────────────────
@@ -774,7 +790,7 @@ def run_heavy_pipeline(
 # ─────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"ok": True, "version": "35.4"}
+    return {"ok": True, "version": "36.0"}
 
 
 @app.get("/cache-stats")
@@ -803,14 +819,11 @@ async def process_sticker(
 
         heavy = run_heavy_pipeline(data, border_ratio=border_ratio, for_preview=True)
 
-        # generate shape-specific mask
-        if shape == "contour-cut":
-            sticker_alpha = heavy["sticker_alpha"]
-        else:
-            sticker_alpha = make_shape_mask(heavy["alpha_mask"], shape, border_ratio)
-
-        # center & scale design inside geometric shapes
-        design_for_compose = fit_design_in_shape(heavy["padded_design"], heavy["alpha_mask"], shape)
+        # apply geometric shape (pads to square, centers design, draws shape mask)
+        # for contour-cut, returns original design + contour mask unchanged
+        design_for_compose, sticker_alpha = apply_geometric_shape(
+            heavy["padded_design"], heavy["alpha_mask"], shape, border_ratio
+        )
 
         final_preview, texture_path = compose_final_preview(
             design_for_compose, sticker_alpha, material
@@ -823,7 +836,7 @@ async def process_sticker(
             "border_ratio": border_ratio,
             "material": material,
             "shape": shape,
-            "debug_version": "35.5",
+            "debug_version": "36.0",
             "debug_cache_hit": heavy["cache_hit"],
             "debug_texture_found": texture_path is not None,
             "debug_bg_method": heavy["bg_method"],
@@ -857,13 +870,10 @@ async def recompose(
         raise HTTPException(404, "Cache miss — please re-upload via /process-sticker.")
 
     try:
-        if shape == "contour-cut":
-            sticker_alpha = cached["sticker_alpha"]
-        else:
-            sticker_alpha = make_shape_mask(cached["alpha_mask"], shape, border_ratio)
-
-        # center & scale design inside geometric shapes
-        design_for_compose = fit_design_in_shape(cached["padded_design"], cached["alpha_mask"], shape)
+        # apply geometric shape (pads to square, centers design, draws shape mask)
+        design_for_compose, sticker_alpha = apply_geometric_shape(
+            cached["padded_design"], cached["alpha_mask"], shape, border_ratio
+        )
 
         final_preview, texture_path = compose_final_preview(
             design_for_compose, sticker_alpha, material
@@ -875,7 +885,7 @@ async def recompose(
             "border_ratio": border_ratio,
             "material": material,
             "shape": shape,
-            "debug_version": "35.5",
+            "debug_version": "36.0",
             "debug_cache_hit": True,
             "debug_texture_found": texture_path is not None,
         })
@@ -942,7 +952,7 @@ async def save_design(
         }
         save_design_to_disk(token, data, meta)
 
-        return JSONResponse({"ok": True, "order_token": token, "debug_version": "35.5"})
+        return JSONResponse({"ok": True, "order_token": token, "debug_version": "36.0"})
     except HTTPException:
         raise
     except Exception as e:
@@ -1188,12 +1198,9 @@ async def webhook_order_paid(request: Request):
 
         heavy = run_heavy_pipeline(file_bytes, border_ratio=border_ratio, for_preview=True)
 
-        if shape == "contour-cut":
-            sticker_alpha = heavy["sticker_alpha"]
-        else:
-            sticker_alpha = make_shape_mask(heavy["alpha_mask"], shape, border_ratio)
-
-        design_for_compose = fit_design_in_shape(heavy["padded_design"], heavy["alpha_mask"], shape)
+        design_for_compose, sticker_alpha = apply_geometric_shape(
+            heavy["padded_design"], heavy["alpha_mask"], shape, border_ratio
+        )
         final_preview, _ = compose_final_preview(design_for_compose, sticker_alpha, material)
 
         pdf_bytes = None
