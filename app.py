@@ -82,7 +82,7 @@ def clean_design_alpha(design_img: Image.Image, max_hole_area: int = 10000) -> n
     return solid
 
 
-def fill_small_inner_holes(mask: np.ndarray, max_hole_area: int = 4200) -> np.ndarray:
+def fill_small_inner_holes(mask: np.ndarray, max_hole_area: int = 5500) -> np.ndarray:
     """
     Rellena solo huecos internos pequeños de la máscara del sticker.
     Los huecos conectados al borde exterior se conservan.
