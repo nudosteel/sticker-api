@@ -1,9 +1,8 @@
-# VERSION 25 - Intelligent component clustering + fixed border
+# VERSION 26 - Rounded contour + dirty edge color cleanup
 
 from io import BytesIO
 import base64
 from pathlib import Path
-import math
 
 import cv2
 import numpy as np
@@ -112,144 +111,69 @@ def fill_small_inner_holes(mask: np.ndarray, max_hole_area: int = 4200) -> np.nd
     return solid
 
 
-def get_components(mask: np.ndarray, min_area: int = 20):
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
-    comps = []
-    for i in range(1, num):
-        x = stats[i, cv2.CC_STAT_LEFT]
-        y = stats[i, cv2.CC_STAT_TOP]
-        w = stats[i, cv2.CC_STAT_WIDTH]
-        h = stats[i, cv2.CC_STAT_HEIGHT]
-        area = stats[i, cv2.CC_STAT_AREA]
-        if area < min_area:
-            continue
-        comps.append({
-            "id": i,
-            "x1": x,
-            "y1": y,
-            "x2": x + w - 1,
-            "y2": y + h - 1,
-            "w": w,
-            "h": h,
-            "area": area
-        })
-    return comps, labels
+def sanitize_design_rgba(design_trimmed: Image.Image, design_alpha: np.ndarray) -> Image.Image:
+    """
+    Limpia color sucio en bordes semitransparentes.
+    No recolorea el diseño real; solo neutraliza píxeles de alpha bajo/medio.
+    """
+    arr = np.array(design_trimmed).astype(np.uint8)
+    arr[:, :, 3] = design_alpha
+
+    alpha = arr[:, :, 3].astype(np.float32) / 255.0
+    rgb = arr[:, :, :3].astype(np.float32)
+
+    # píxeles casi invisibles: color a negro
+    very_low = arr[:, :, 3] < 20
+    rgb[very_low] = 0
+
+    # píxeles semitransparentes: neutralizar matte raro sobre base blanca
+    semi = (arr[:, :, 3] >= 20) & (arr[:, :, 3] < 245)
+    if np.any(semi):
+        a = alpha[semi][:, None]
+        rgb[semi] = rgb[semi] * a + 255.0 * (1.0 - a)
+
+    arr[:, :, :3] = np.clip(rgb, 0, 255).astype(np.uint8)
+    return Image.fromarray(arr, "RGBA")
 
 
-def bbox_gap(a, b):
-    dx = max(0, max(a["x1"], b["x1"]) - min(a["x2"], b["x2"]))
-    dy = max(0, max(a["y1"], b["y1"]) - min(a["y2"], b["y2"]))
-    return math.hypot(dx, dy), dx, dy
+def merge_nearby_components(mask: np.ndarray) -> np.ndarray:
+    """
+    Une componentes cercanos sin destruir la forma.
+    Ayuda en casos como icono + texto.
+    """
+    h, w = mask.shape
+    max_dim = max(h, w)
 
-
-def overlap_ratio_1d(a1, a2, b1, b2):
-    inter = max(0, min(a2, b2) - max(a1, b1))
-    span = max(1, min(a2 - a1, b2 - b1))
-    return inter / span
-
-
-class DSU:
-    def __init__(self, n):
-        self.p = list(range(n))
-
-    def find(self, x):
-        while self.p[x] != x:
-            self.p[x] = self.p[self.p[x]]
-            x = self.p[x]
-        return x
-
-    def union(self, a, b):
-        ra, rb = self.find(a), self.find(b)
-        if ra != rb:
-            self.p[rb] = ra
-
-
-def cluster_components(components, max_dim):
-    if not components:
-        return []
-
-    dsu = DSU(len(components))
-
-    base_gap = max(10, int(max_dim * 0.03))
-    strong_gap = max(14, int(max_dim * 0.045))
-
-    for i in range(len(components)):
-        for j in range(i + 1, len(components)):
-            a = components[i]
-            b = components[j]
-
-            gap, dx, dy = bbox_gap(a, b)
-            y_overlap = overlap_ratio_1d(a["y1"], a["y2"], b["y1"], b["y2"])
-            x_overlap = overlap_ratio_1d(a["x1"], a["x2"], b["x1"], b["x2"])
-
-            # unión inteligente:
-            # - elementos cercanos en la misma línea (icono + texto)
-            # - letras cercanas entre sí
-            # - piezas casi tocándose
-            should_join = (
-                gap <= base_gap or
-                (dx <= strong_gap and y_overlap > 0.20) or
-                (dy <= strong_gap and x_overlap > 0.20)
-            )
-
-            if should_join:
-                dsu.union(i, j)
-
-    groups = {}
-    for idx, comp in enumerate(components):
-        root = dsu.find(idx)
-        groups.setdefault(root, []).append(comp)
-
-    return list(groups.values())
-
-
-def merge_component_cluster(labels, cluster, max_dim):
-    mask = np.zeros(labels.shape, dtype=np.uint8)
-    ids = [c["id"] for c in cluster]
-    ids_set = set(ids)
-    mask[np.isin(labels, list(ids_set))] = 255
-
-    # une piezas cercanas dentro del cluster
     bridge_px = max(7, int(max_dim * 0.02))
     bridge_kernel = make_ellipse_kernel(bridge_px)
-    merged = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, bridge_kernel, iterations=1)
 
+    merged = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, bridge_kernel, iterations=1)
     return merged
 
 
 def make_sticker_mask(design_alpha: np.ndarray) -> np.ndarray:
     """
-    VERSION 25:
-    - detecta componentes
-    - une solo componentes cercanos
-    - genera borde fijo
-    - conserva una silueta limpia y estable
+    VERSION 26:
+    - une componentes cercanos suavemente
+    - aplica el borde fijo que te gusta
+    - redondea un poco el contorno
+    - sin blur destructivo
     """
     h, w = design_alpha.shape
-    max_dim = max(h, w)
 
-    # limpia ruido mínimo
-    open_kernel = make_ellipse_kernel(max(3, int(max_dim * 0.006)))
-    cleaned = cv2.morphologyEx(design_alpha, cv2.MORPH_OPEN, open_kernel, iterations=1)
+    merged = merge_nearby_components(design_alpha)
 
-    components, labels = get_components(cleaned, min_area=max(20, int(max_dim * 0.002)))
-    clusters = cluster_components(components, max_dim)
-
-    merged_global = np.zeros_like(cleaned)
-    for cluster in clusters:
-        cluster_mask = merge_component_cluster(labels, cluster, max_dim)
-        merged_global = cv2.bitwise_or(merged_global, cluster_mask)
-
-    # AJUSTE FIJO DEL BORDE QUE QUIERES MANTENER
-    border_px = max(18, int(max_dim * 0.06))
+    # AJUSTE FIJO DEL BORDE
+    border_px = max(18, int(max(h, w) * 0.06))
     border_kernel = make_ellipse_kernel(border_px)
-    dilated = cv2.dilate(merged_global, border_kernel, iterations=1)
+    dilated = cv2.dilate(merged, border_kernel, iterations=1)
 
-    # suavizado estructural, no blur destructivo
-    close_size = max(5, border_px // 3)
-    close_kernel = make_ellipse_kernel(close_size)
-    shaped = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, close_kernel, iterations=1)
-    shaped = cv2.morphologyEx(shaped, cv2.MORPH_OPEN, close_kernel, iterations=1)
+    # redondeo estructural
+    round_size = max(5, border_px // 3)
+    round_kernel = make_ellipse_kernel(round_size)
+
+    shaped = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, round_kernel, iterations=1)
+    shaped = cv2.morphologyEx(shaped, cv2.MORPH_OPEN, round_kernel, iterations=1)
 
     shaped = fill_small_inner_holes(shaped, max_hole_area=4200)
 
@@ -328,7 +252,7 @@ def compose_final_preview(design_img: Image.Image, sticker_alpha: np.ndarray, ma
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": 25}
+    return {"ok": True, "version": 26}
 
 
 @app.post("/process-sticker")
@@ -342,17 +266,7 @@ async def process_sticker(
         design_trimmed = trim_transparent(raw_img, padding_ratio=0.08)
 
         design_alpha = clean_design_alpha(design_trimmed, max_hole_area=10000)
-
-        design_arr = np.array(design_trimmed)
-        design_arr[:, :, 3] = design_alpha
-
-        # limpia RGB basura en píxeles casi transparentes
-        low_alpha = design_arr[:, :, 3] < 20
-        design_arr[low_alpha, 0] = 0
-        design_arr[low_alpha, 1] = 0
-        design_arr[low_alpha, 2] = 0
-
-        design_img = Image.fromarray(design_arr, "RGBA")
+        design_img = sanitize_design_rgba(design_trimmed, design_alpha)
 
         sticker_alpha = make_sticker_mask(design_alpha)
 
@@ -366,7 +280,7 @@ async def process_sticker(
             "debug_material": material,
             "debug_texture_found": texture_path is not None,
             "debug_texture_path": texture_path,
-            "debug_version": 25
+            "debug_version": 26
         })
     except Exception as e:
         return JSONResponse(
