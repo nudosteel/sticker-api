@@ -1,10 +1,9 @@
-# VERSION 31.2 - Debug masks + transparent debug PNGs
+# gemini VERSION 32 - Fast Gaussian Metaball (Railway Crash-Proof & Perfect Bubble)
 
 from io import BytesIO
 import base64
 from pathlib import Path
 import math
-import traceback
 
 import cv2
 import numpy as np
@@ -32,14 +31,6 @@ def to_base64(img: Image.Image) -> str:
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
-def mask_to_base64(mask: np.ndarray) -> str:
-    h, w = mask.shape
-    rgba = np.zeros((h, w, 4), dtype=np.uint8)
-    rgba[:, :, 3] = mask
-    img = Image.fromarray(rgba, "RGBA")
-    return to_base64(img)
-
-
 def load_rgba_from_bytes(data: bytes) -> Image.Image:
     return Image.open(BytesIO(data)).convert("RGBA")
 
@@ -48,11 +39,13 @@ def trim_transparent(img: Image.Image, padding_ratio: float = 0.08) -> Image.Ima
     arr = np.array(img)
     alpha = arr[:, :, 3]
     ys, xs = np.where(alpha > 0)
+
     if len(xs) == 0 or len(ys) == 0:
         return img
 
     x1, x2 = xs.min(), xs.max()
     y1, y2 = ys.min(), ys.max()
+
     w = x2 - x1 + 1
     h = y2 - y1 + 1
     pad = int(max(w, h) * padding_ratio)
@@ -62,19 +55,8 @@ def trim_transparent(img: Image.Image, padding_ratio: float = 0.08) -> Image.Ima
     right = min(arr.shape[1], x2 + pad + 1)
     bottom = min(arr.shape[0], y2 + pad + 1)
 
-    return Image.fromarray(arr[top:bottom, left:right], "RGBA")
-
-
-def make_ellipse_kernel(w: int, h: int = None) -> np.ndarray:
-    if h is None:
-        h = w
-    w = max(3, int(w))
-    h = max(3, int(h))
-    if w % 2 == 0:
-        w += 1
-    if h % 2 == 0:
-        h += 1
-    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (w, h))
+    cropped = arr[top:bottom, left:right]
+    return Image.fromarray(cropped, "RGBA")
 
 
 def sanitize_design_rgba(design_trimmed: Image.Image) -> Image.Image:
@@ -110,12 +92,12 @@ def get_components(mask: np.ndarray, min_area: int = 16):
         w = stats[i, cv2.CC_STAT_WIDTH]
         h = stats[i, cv2.CC_STAT_HEIGHT]
         area = stats[i, cv2.CC_STAT_AREA]
-        if area < min_area:
-            continue
+
+        if area < min_area: continue
+
         comps.append({
-            "id": i,
-            "x1": x, "y1": y, "x2": x + w - 1, "y2": y + h - 1,
-            "w": w, "h": h, "area": area
+            "id": i, "x1": x, "y1": y, "x2": x + w - 1, "y2": y + h - 1,
+            "w": w, "h": h, "area": area,
         })
     return comps, labels
 
@@ -127,106 +109,53 @@ def bbox_gap(a, b):
 
 
 class DSU:
-    def __init__(self, n):
-        self.p = list(range(n))
-
+    def __init__(self, n): self.p = list(range(n))
     def find(self, x):
         while self.p[x] != x:
             self.p[x] = self.p[self.p[x]]
             x = self.p[x]
         return x
-
     def union(self, a, b):
         ra, rb = self.find(a), self.find(b)
-        if ra != rb:
-            self.p[rb] = ra
+        if ra != rb: self.p[rb] = ra
 
 
 def cluster_components(components, max_dim):
-    if not components:
-        return []
-
+    if not components: return []
     dsu = DSU(len(components))
-    gap_x = max(10, int(max_dim * 0.035))
-    gap_y = max(10, int(max_dim * 0.04))
-    diag_gap = max(12, int(max_dim * 0.045))
+    horizontal_gap = max(12, int(max_dim * 0.05))
+    vertical_gap = max(10, int(max_dim * 0.04))
+    diag_gap = max(14, int(max_dim * 0.055))
 
     for i in range(len(components)):
         for j in range(i + 1, len(components)):
-            a = components[i]
-            b = components[j]
-            dx, dy, dist = bbox_gap(a, b)
-
-            same_row = dy <= gap_y and dx <= gap_x * 2
-            stacked = dx <= gap_x and dy <= gap_y * 2
-            near = dist <= diag_gap
-
-            if same_row or stacked or near:
+            dx, dy, dist = bbox_gap(components[i], components[j])
+            if dy <= vertical_gap or dx <= horizontal_gap or dist <= diag_gap:
                 dsu.union(i, j)
 
     groups = {}
     for idx, comp in enumerate(components):
-        root = dsu.find(idx)
-        groups.setdefault(root, []).append(comp)
+        groups.setdefault(dsu.find(idx), []).append(comp)
     return list(groups.values())
 
 
-def cluster_mask_from_labels(labels: np.ndarray, cluster) -> np.ndarray:
+def merge_cluster_mask(labels: np.ndarray, cluster) -> np.ndarray:
     mask = np.zeros(labels.shape, dtype=np.uint8)
     ids = [c["id"] for c in cluster]
     mask[np.isin(labels, ids)] = 255
     return mask
 
 
-def merge_cluster_shape(cluster_mask: np.ndarray, max_dim: int) -> np.ndarray:
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(cluster_mask, 8)
-    if num <= 2:
-        return cluster_mask
-
-    comps = []
-    for i in range(1, num):
-        x = stats[i, cv2.CC_STAT_LEFT]
-        y = stats[i, cv2.CC_STAT_TOP]
-        w = stats[i, cv2.CC_STAT_WIDTH]
-        h = stats[i, cv2.CC_STAT_HEIGHT]
-        comps.append((x, y, w, h))
-
-    total_w = max(x + w for x, y, w, h in comps) - min(x for x, y, w, h in comps)
-    total_h = max(y + h for x, y, w, h in comps) - min(y for x, y, w, h in comps)
-
-    if total_w >= total_h * 1.4:
-        kernel = make_ellipse_kernel(max(5, int(max_dim * 0.012)), max(3, int(max_dim * 0.006)))
-    else:
-        kernel = make_ellipse_kernel(max(5, int(max_dim * 0.010)), max(7, int(max_dim * 0.016)))
-
-    return cv2.morphologyEx(cluster_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-
-def metaball_outline(mask: np.ndarray, border_px: int) -> np.ndarray:
-    inv = 255 - mask
-    dist = cv2.distanceTransform(inv, cv2.DIST_L2, 5)
-    expanded = np.where(dist <= border_px, 255, 0).astype(np.uint8)
-
-    blur = max(5, int(border_px * 0.55))
-    if blur % 2 == 0:
-        blur += 1
-
-    blurred = cv2.GaussianBlur(expanded, (blur, blur), 0)
-    _, smooth = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
-
-    clean_k = max(3, int(border_px * 0.18))
-    kernel = make_ellipse_kernel(clean_k)
-    smooth = cv2.morphologyEx(smooth, cv2.MORPH_CLOSE, kernel, iterations=1)
-    smooth = cv2.morphologyEx(smooth, cv2.MORPH_OPEN, kernel, iterations=1)
-
-    return smooth
+def exact_circular_dilate(mask: np.ndarray, radius: float) -> np.ndarray:
+    if radius <= 0: return mask
+    dist = cv2.distanceTransform(255 - mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    return np.where(dist <= radius, 255, 0).astype(np.uint8)
 
 
 def fill_small_inner_holes(mask: np.ndarray, max_hole_area: int = 4200) -> np.ndarray:
     solid = mask.copy()
     inv = 255 - solid
     num, labels, stats, _ = cv2.connectedComponentsWithStats(inv, 8)
-
     h, w = solid.shape
     border = set()
     border.update(np.unique(labels[0, :]).tolist())
@@ -235,39 +164,58 @@ def fill_small_inner_holes(mask: np.ndarray, max_hole_area: int = 4200) -> np.nd
     border.update(np.unique(labels[:, w - 1]).tolist())
 
     for i in range(1, num):
-        if i in border:
-            continue
+        if i in border: continue
         if stats[i, cv2.CC_STAT_AREA] <= max_hole_area:
             solid[labels == i] = 255
-
     return solid
 
 
-def make_sticker_mask(alpha_mask: np.ndarray):
+def make_sticker_mask(alpha_mask: np.ndarray) -> np.ndarray:
     h, w = alpha_mask.shape
     max_dim = max(h, w)
 
+    # 1. Agrupar piezas (para textos separados)
     comps, labels = get_components(alpha_mask, min_area=max(16, int(max_dim * 0.001)))
     clusters = cluster_components(comps, max_dim)
 
+    base = np.zeros_like(alpha_mask)
+    target_offset = max(18, int(max_dim * 0.06))
+    bridge_radius = max(3, int(max_dim * 0.012))
+    dilate_radius = target_offset - bridge_radius
+    if dilate_radius < 1: dilate_radius = 1
+
     if not clusters:
-        base = alpha_mask.copy()
+        base = alpha_mask
     else:
-        base = np.zeros_like(alpha_mask)
         for cluster in clusters:
-            cluster_mask = cluster_mask_from_labels(labels, cluster)
-            cluster_mask = merge_cluster_shape(cluster_mask, max_dim)
-            base = cv2.bitwise_or(base, cluster_mask)
+            cluster_mask = merge_cluster_mask(labels, cluster)
+            if bridge_radius > 0:
+                bridged = exact_circular_dilate(cluster_mask, bridge_radius)
+                base = cv2.bitwise_or(base, bridged)
+            else:
+                base = cv2.bitwise_or(base, cluster_mask)
 
-    border_px = max(18, int(max_dim * 0.06))
-    sticker = metaball_outline(base, border_px)
-    sticker = fill_small_inner_holes(sticker, max_hole_area=4200)
+    # 2. Expansión principal
+    dilated = exact_circular_dilate(base, dilate_radius)
 
-    contours, _ = cv2.findContours(sticker, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    final_mask = np.zeros_like(sticker)
+    # 3. Rellenar huecos antes de suavizar
+    solid = fill_small_inner_holes(dilated, max_hole_area=int(max_dim * max_dim * 0.1))
+
+    # 4. LA MAGIA METABALL: Desenfoque Gaussiano Extremo + Thresholding
+    # Esto es rapidísimo, no crashea Railway y convierte CUALQUIER polígono en una curva burbujeante.
+    blur_size = int(target_offset * 1.8) # Muy alto para derretir las esquinas
+    if blur_size % 2 == 0: blur_size += 1
+    blur_size = max(11, blur_size)
+
+    blurred = cv2.GaussianBlur(solid, (blur_size, blur_size), 0)
+    _, shaped = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
+
+    # 5. Limpieza final de contornos
+    contours, _ = cv2.findContours(shaped, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    final_mask = np.zeros_like(shaped)
     cv2.drawContours(final_mask, contours, -1, 255, thickness=cv2.FILLED)
 
-    return base, final_mask
+    return final_mask
 
 
 def make_rgba_from_alpha(alpha: np.ndarray, rgb=(255, 255, 255)) -> Image.Image:
@@ -282,26 +230,20 @@ def make_rgba_from_alpha(alpha: np.ndarray, rgb=(255, 255, 255)) -> Image.Image:
 
 def find_texture(filename: str) -> Path | None:
     exact = BASE_DIR / "textures" / filename
-    if exact.exists():
-        return exact
+    if exact.exists(): return exact
     railway_path = Path("/app/textures") / filename
-    if railway_path.exists():
-        return railway_path
+    if railway_path.exists(): return railway_path
     for p in BASE_DIR.rglob(filename):
-        if p.is_file():
-            return p
+        if p.is_file(): return p
     return None
 
 
-def load_texture(material: str, size):
+def load_texture(material: str, size: tuple[int, int]):
     if material == "holographic":
         path = find_texture("holographic.png")
     else:
         path = None
-
-    if path is None:
-        return None, None
-
+    if path is None: return None, None
     tex = Image.open(path).convert("RGBA")
     tex = tex.resize(size, Image.Resampling.LANCZOS)
     return tex, str(path)
@@ -323,9 +265,11 @@ def compose_final_preview(design_img: Image.Image, sticker_alpha: np.ndarray, ma
             holo_base = apply_alpha_mask(texture, sticker_alpha)
             canvas.alpha_composite(holo_base)
         else:
-            canvas.alpha_composite(make_rgba_from_alpha(sticker_alpha, (255, 255, 255)))
+            white_base = make_rgba_from_alpha(sticker_alpha, (255, 255, 255))
+            canvas.alpha_composite(white_base)
     else:
-        canvas.alpha_composite(make_rgba_from_alpha(sticker_alpha, (255, 255, 255)))
+        white_base = make_rgba_from_alpha(sticker_alpha, (255, 255, 255))
+        canvas.alpha_composite(white_base)
 
     canvas.alpha_composite(design_img)
     return canvas, texture_path
@@ -333,11 +277,14 @@ def compose_final_preview(design_img: Image.Image, sticker_alpha: np.ndarray, ma
 
 @app.get("/")
 def root():
-    return {"ok": True, "version": "31.2"}
+    return {"ok": True, "version": 32}
 
 
 @app.post("/process-sticker")
-async def process_sticker(file: UploadFile = File(...), material: str = Form("vinyl")):
+async def process_sticker(
+    file: UploadFile = File(...),
+    material: str = Form("vinyl")
+):
     try:
         data = await file.read()
         raw_img = load_rgba_from_bytes(data)
@@ -345,26 +292,23 @@ async def process_sticker(file: UploadFile = File(...), material: str = Form("vi
 
         clean_design = sanitize_design_rgba(design_trimmed)
         alpha_mask = build_alpha_mask(clean_design)
-        base_mask, sticker_alpha = make_sticker_mask(alpha_mask)
 
+        sticker_alpha = make_sticker_mask(alpha_mask)
+
+        contour_img = make_rgba_from_alpha(sticker_alpha, (255, 255, 255))
         final_preview, texture_path = compose_final_preview(clean_design, sticker_alpha, material)
 
         return JSONResponse({
             "ok": True,
             "final_preview_png": to_base64(final_preview),
-            "debug_alpha_mask_png": mask_to_base64(alpha_mask),
-            "debug_base_mask_png": mask_to_base64(base_mask),
-            "debug_sticker_mask_png": mask_to_base64(sticker_alpha),
+            "contour_png": to_base64(contour_img),
+            "debug_material": material,
             "debug_texture_found": texture_path is not None,
             "debug_texture_path": texture_path,
-            "debug_version": "31.2"
+            "debug_version": 32
         })
     except Exception as e:
         return JSONResponse(
             status_code=500,
-            content={
-                "ok": False,
-                "error": str(e),
-                "trace": traceback.format_exc()
-            }
+            content={"ok": False, "error": str(e)}
         )
