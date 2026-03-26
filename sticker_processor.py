@@ -1,4 +1,4 @@
-# VERSION 36.2 - PDF upload support + geometric shapes + any-color bg removal
+# VERSION 36.3 - PDF upload support + geometric shapes + any-color bg removal
 # Changes from v36.1:
 #   - NEW: PDF file upload support via PyMuPDF (fitz)
 #   - convert_pdf_to_rgba() converts first page of PDF to RGBA at 216 DPI
@@ -138,16 +138,19 @@ def to_base64(img: Image.Image) -> str:
 
 
 def convert_pdf_to_rgba(data: bytes) -> Image.Image:
-    """Convert first page of PDF to RGBA image at high resolution."""
+    """Convert first page of PDF to RGBA image at high resolution.
+    Renders WITHOUT alpha so background is white (not transparent).
+    This lets the pipeline detect and remove the white background
+    just like it does for JPG/PNG images."""
     if not HAS_PYMUPDF:
         raise HTTPException(400, "PDF no soportado (PyMuPDF no instalado)")
     doc = fitz.open(stream=data, filetype="pdf")
     page = doc[0]
     mat = fitz.Matrix(3.0, 3.0)  # 3x zoom = ~216 DPI
-    pix = page.get_pixmap(matrix=mat, alpha=True)
-    img = Image.frombytes("RGBA", [pix.width, pix.height], pix.samples)
+    pix = page.get_pixmap(matrix=mat, alpha=False)  # white background, no alpha
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     doc.close()
-    return img
+    return img.convert("RGBA")  # convert to RGBA with all alpha=255
 
 
 def load_rgba_from_bytes(data: bytes) -> Image.Image:
@@ -832,7 +835,7 @@ def run_heavy_pipeline(
 # ─────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"ok": True, "version": "36.2"}
+    return {"ok": True, "version": "36.3"}
 
 
 @app.get("/cache-stats")
@@ -875,7 +878,7 @@ async def process_sticker(
             "border_ratio": border_ratio,
             "material": material,
             "shape": shape,
-            "debug_version": "36.2",
+            "debug_version": "36.3",
             "debug_cache_hit": heavy["cache_hit"],
             "debug_texture_found": texture_path is not None,
             "debug_bg_method": heavy["bg_method"],
@@ -922,7 +925,7 @@ async def recompose(
             "border_ratio": border_ratio,
             "material": material,
             "shape": shape,
-            "debug_version": "36.2",
+            "debug_version": "36.3",
             "debug_cache_hit": True,
             "debug_texture_found": texture_path is not None,
         })
@@ -985,7 +988,7 @@ async def save_design(
         }
         save_design_to_disk(token, data, meta)
 
-        return JSONResponse({"ok": True, "order_token": token, "debug_version": "36.2"})
+        return JSONResponse({"ok": True, "order_token": token, "debug_version": "36.3"})
     except HTTPException:
         raise
     except Exception as e:
