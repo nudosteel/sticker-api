@@ -1,4 +1,4 @@
-# VERSION 36.3 - PDF upload support + geometric shapes + any-color bg removal
+# VERSION 36.4 - PDF upload support + geometric shapes + any-color bg removal
 # Changes from v36.1:
 #   - NEW: PDF file upload support via PyMuPDF (fitz)
 #   - convert_pdf_to_rgba() converts first page of PDF to RGBA at 216 DPI
@@ -316,12 +316,12 @@ def prepare_input_image(img: Image.Image) -> tuple[Image.Image, str]:
         removed = remove_solid_background(img, bg_color, tolerance=40)
         rm_alpha = np.array(removed)[:, :, 3]
         coverage = float(np.count_nonzero(rm_alpha)) / float(rm_alpha.size)
-        if 0.001 < coverage < 0.85:
+        if 0.001 < coverage < 0.97:
             return removed, "solid_bg"
     light_bg = extract_logo_from_light_background(img)
     light_alpha = np.array(light_bg)[:, :, 3]
     coverage = float(np.count_nonzero(light_alpha)) / float(light_alpha.size)
-    if 0.001 < coverage < 0.55:
+    if 0.001 < coverage < 0.97:
         return light_bg, "light_bg"
     return img, "none"
 
@@ -835,7 +835,7 @@ def run_heavy_pipeline(
 # ─────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"ok": True, "version": "36.3"}
+    return {"ok": True, "version": "36.4"}
 
 
 @app.get("/cache-stats")
@@ -878,7 +878,7 @@ async def process_sticker(
             "border_ratio": border_ratio,
             "material": material,
             "shape": shape,
-            "debug_version": "36.3",
+            "debug_version": "36.4",
             "debug_cache_hit": heavy["cache_hit"],
             "debug_texture_found": texture_path is not None,
             "debug_bg_method": heavy["bg_method"],
@@ -925,7 +925,7 @@ async def recompose(
             "border_ratio": border_ratio,
             "material": material,
             "shape": shape,
-            "debug_version": "36.3",
+            "debug_version": "36.4",
             "debug_cache_hit": True,
             "debug_texture_found": texture_path is not None,
         })
@@ -988,7 +988,7 @@ async def save_design(
         }
         save_design_to_disk(token, data, meta)
 
-        return JSONResponse({"ok": True, "order_token": token, "debug_version": "36.3"})
+        return JSONResponse({"ok": True, "order_token": token, "debug_version": "36.4"})
     except HTTPException:
         raise
     except Exception as e:
