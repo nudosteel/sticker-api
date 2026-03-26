@@ -1,18 +1,12 @@
-# VERSION 36.1 - Geometric shapes + Any-color background removal
-# Changes from v35.x:
-#   - NEW: apply_geometric_shape() — single function handles everything:
-#     1. Pads canvas to SQUARE so circles never get clipped on wide/tall designs
-#     2. Scales design down (~55% fill) and centers it on the square canvas
-#     3. Draws the geometric mask (circle, oval, square, rounded) on the square canvas
-#   - Replaces old make_shape_mask() + fit_design_in_shape() which didn't work
-#   - Integrated into /process-sticker, /recompose, and /webhook/order-paid
-# Changes from v35.2:
-#   - Shape support: circle, square, oval, rounded, contour-cut
-#   - /save-design endpoint: saves design to disk for post-payment processing
-#   - /webhook/order-paid: WooCommerce webhook → generates PDF + sends email
-#   - /process-sticker and /recompose now accept shape parameter
-#   - alpha_mask cached for fast shape regeneration
-#   - New materials: transparent, reflective
+# VERSION 36.2 - PDF upload support + geometric shapes + any-color bg removal
+# Changes from v36.1:
+#   - NEW: PDF file upload support via PyMuPDF (fitz)
+#   - convert_pdf_to_rgba() converts first page of PDF to RGBA at 216 DPI
+#   - load_rgba_from_bytes() auto-detects PDF by magic bytes
+#   - VALID_FORMATS updated to include application/pdf
+# Previous changes (v36.1):
+#   - apply_geometric_shape() for circle, oval, square, rounded, contour-cut
+#   - /save-design, /webhook/order-paid endpoints
 #   - reportlab PDF generation for plotter-ready output
 
 from io import BytesIO
@@ -54,6 +48,12 @@ try:
 except ImportError:
     HAS_REPORTLAB = False
 
+try:
+    import fitz  # PyMuPDF
+    HAS_PYMUPDF = True
+except ImportError:
+    HAS_PYMUPDF = False
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -78,13 +78,13 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-MAX_FILE_SIZE_MB = 15
+MAX_FILE_SIZE_MB = 18
 MAX_DIMENSION_PX = 5000
 PREVIEW_MAX_DIM = 1200
 CACHE_TTL_SECONDS = 600
 CACHE_MAX_ENTRIES = 50
 
-VALID_FORMATS = {"image/png", "image/jpeg", "image/webp", "image/tiff", "image/bmp"}
+VALID_FORMATS = {"image/png", "image/jpeg", "image/webp", "image/tiff", "image/bmp", "application/pdf"}
 VALID_MATERIALS = {"vinyl", "matte", "clear", "holographic", "kraft", "glitter", "mirror", "transparent", "reflective"}
 VALID_SHAPES = {"contour-cut", "square", "circle", "oval", "rounded"}
 
@@ -137,7 +137,22 @@ def to_base64(img: Image.Image) -> str:
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
+def convert_pdf_to_rgba(data: bytes) -> Image.Image:
+    """Convert first page of PDF to RGBA image at high resolution."""
+    if not HAS_PYMUPDF:
+        raise HTTPException(400, "PDF no soportado (PyMuPDF no instalado)")
+    doc = fitz.open(stream=data, filetype="pdf")
+    page = doc[0]
+    mat = fitz.Matrix(3.0, 3.0)  # 3x zoom = ~216 DPI
+    pix = page.get_pixmap(matrix=mat, alpha=True)
+    img = Image.frombytes("RGBA", [pix.width, pix.height], pix.samples)
+    doc.close()
+    return img
+
+
 def load_rgba_from_bytes(data: bytes) -> Image.Image:
+    if data[:5] == b'%PDF-':
+        return convert_pdf_to_rgba(data)
     return Image.open(BytesIO(data)).convert("RGBA")
 
 
@@ -221,58 +236,33 @@ def build_alpha_mask(img: Image.Image) -> np.ndarray:
 # BACKGROUND REMOVAL
 # ─────────────────────────────────────────────
 def detect_background_color(img_rgb: np.ndarray) -> tuple[np.ndarray, bool]:
-    """
-    Detects the dominant background color by sampling the image borders.
-    Returns (bg_color_rgb, is_solid_bg).
-    """
     h, w = img_rgb.shape[:2]
     border_px = max(5, min(h, w) // 15)
-
-    # sample pixels from all 4 edges
     top = img_rgb[:border_px, :].reshape(-1, 3)
     bottom = img_rgb[h - border_px:, :].reshape(-1, 3)
     left = img_rgb[:, :border_px].reshape(-1, 3)
     right = img_rgb[:, w - border_px:].reshape(-1, 3)
     border_pixels = np.vstack([top, bottom, left, right])
-
-    # compute median color of border
     median_color = np.median(border_pixels, axis=0).astype(np.uint8)
-
-    # check how consistent the border color is (low std = solid bg)
     diffs = np.abs(border_pixels.astype(np.float32) - median_color.astype(np.float32))
     mean_diff = np.mean(diffs)
-
-    # if border pixels are very consistent (mean diff < 30), it's a solid bg
     is_solid = mean_diff < 30
-
     return median_color, is_solid
 
 
 def remove_solid_background(img: Image.Image, bg_color: np.ndarray, tolerance: int = 40) -> Image.Image:
-    """
-    Removes pixels that are close to bg_color. Works for any solid background color.
-    """
     rgba = img.convert("RGBA")
     arr = np.array(rgba)
     rgb = arr[:, :, :3].astype(np.float32)
     bg = bg_color.astype(np.float32)
-
-    # color distance from background
     diff = np.sqrt(np.sum((rgb - bg) ** 2, axis=2))
-
-    # foreground = pixels far from bg color
-    # soft edge: ramp from 0 to 255 between tolerance*0.6 and tolerance*1.2
     inner = tolerance * 0.6
     outer = tolerance * 1.2
     alpha_f = np.clip((diff - inner) / max(1, outer - inner), 0, 1)
     fg_alpha = (alpha_f * 255).astype(np.uint8)
-
-    # morphological cleanup
     fg_binary = (fg_alpha > 30).astype(np.uint8) * 255
     fg_binary = cv2.morphologyEx(fg_binary, cv2.MORPH_OPEN, make_ellipse_kernel(3), iterations=1)
     fg_binary = cv2.morphologyEx(fg_binary, cv2.MORPH_CLOSE, make_ellipse_kernel(7), iterations=2)
-
-    # remove tiny noise components
     num, labels, stats, _ = cv2.connectedComponentsWithStats(fg_binary, 8)
     h, w = fg_binary.shape
     min_area = max(40, int((h * w) * 0.0005))
@@ -280,19 +270,15 @@ def remove_solid_background(img: Image.Image, bg_color: np.ndarray, tolerance: i
     for i in range(1, num):
         if stats[i, cv2.CC_STAT_AREA] >= min_area:
             clean[labels == i] = 255
-
-    # blend: use clean mask but preserve soft edges from color distance
     alpha_final = np.minimum(fg_alpha, clean)
     alpha_final = cv2.GaussianBlur(alpha_final.astype(np.float32), (0, 0), sigmaX=1.2, sigmaY=1.2)
     alpha_final = np.clip(alpha_final, 0, 255).astype(np.uint8)
-
     out = arr.copy()
     out[:, :, 3] = alpha_final
     return Image.fromarray(out, "RGBA")
 
 
 def extract_logo_from_light_background(img: Image.Image) -> Image.Image:
-    """Legacy: removes white/very light backgrounds."""
     rgba = img.convert("RGBA")
     arr = np.array(rgba)
     rgb = arr[:, :, :3]
@@ -319,30 +305,21 @@ def extract_logo_from_light_background(img: Image.Image) -> Image.Image:
 
 def prepare_input_image(img: Image.Image) -> tuple[Image.Image, str]:
     img = img.convert("RGBA")
-
-    # 1. if image already has alpha transparency, use it as-is
     if has_useful_alpha(img):
         return img, "alpha"
-
-    # 2. detect background color from image borders
     rgb = np.array(img)[:, :, :3]
     bg_color, is_solid = detect_background_color(rgb)
-
-    # 3. if solid background detected, remove it (works for ANY color)
     if is_solid:
         removed = remove_solid_background(img, bg_color, tolerance=40)
         rm_alpha = np.array(removed)[:, :, 3]
         coverage = float(np.count_nonzero(rm_alpha)) / float(rm_alpha.size)
         if 0.001 < coverage < 0.85:
             return removed, "solid_bg"
-
-    # 4. fallback: try white/light background removal
     light_bg = extract_logo_from_light_background(img)
     light_alpha = np.array(light_bg)[:, :, 3]
     coverage = float(np.count_nonzero(light_alpha)) / float(light_alpha.size)
     if 0.001 < coverage < 0.55:
         return light_bg, "light_bg"
-
     return img, "none"
 
 
@@ -512,7 +489,6 @@ def fill_small_inner_holes(mask: np.ndarray, max_hole_area: int = 4200) -> np.nd
 
 
 def make_sticker_mask(alpha_mask: np.ndarray, border_ratio: float = 0.028) -> np.ndarray:
-    """Contour-cut mask: organic border following the design shape."""
     h, w = alpha_mask.shape
     max_dim = max(h, w)
     comps, labels = get_components(alpha_mask, min_area=max(16, int(max_dim * 0.001)))
@@ -551,22 +527,12 @@ def apply_geometric_shape(
     shape: str,
     border_ratio: float = 0.028,
 ) -> tuple[Image.Image, np.ndarray]:
-    """
-    All-in-one handler for geometric shapes (circle, square, oval, rounded).
-    1. Pads the canvas to a SQUARE so circles/ovals never get clipped.
-    2. Scales + centers the design content inside the square canvas (~55% fill).
-    3. Draws the geometric shape mask on that square canvas.
-    Returns (new_design_img, new_sticker_alpha) both on the square canvas.
-    For contour-cut, returns originals unchanged.
-    """
     if shape == "contour-cut":
         sticker_alpha = make_sticker_mask(alpha_mask, border_ratio)
         return design_img, sticker_alpha
 
     orig_w, orig_h = design_img.size
 
-    # --- Step 1: figure out the square canvas size ---
-    # Find the design bounding box
     ys, xs = np.where(alpha_mask > 0)
     if len(xs) == 0:
         mask = np.zeros((orig_h, orig_w), dtype=np.uint8)
@@ -577,14 +543,10 @@ def apply_geometric_shape(
     dw = x2 - x1 + 1
     dh = y2 - y1 + 1
 
-    # The square canvas must be large enough to contain the shape with border.
-    # Design will occupy ~55% of the shape interior.
-    # Shape extends: design_half / 0.55 + border_px
     design_diag = max(dw, dh)
     border_px = max(10, int(design_diag * border_ratio))
 
     if shape == "circle":
-        # radius needed to contain design at 55% fill
         radius = int((design_diag / 2) / 0.55 + border_px)
         sq_size = radius * 2 + border_px * 4
     elif shape == "oval":
@@ -605,7 +567,6 @@ def apply_geometric_shape(
         sticker_alpha = make_sticker_mask(alpha_mask, border_ratio)
         return design_img, sticker_alpha
 
-    # ensure minimum size and make it even
     sq_size = max(sq_size, max(orig_w, orig_h))
     if sq_size % 2 != 0:
         sq_size += 1
@@ -613,14 +574,12 @@ def apply_geometric_shape(
     cx = sq_size // 2
     cy = sq_size // 2
 
-    # --- Step 2: crop and scale the design content, center on square canvas ---
     design_arr = np.array(design_img)
     cropped = Image.fromarray(design_arr[y1:y2+1, x1:x2+1], "RGBA")
 
-    # design should occupy ~55% of the square canvas
     target_area = sq_size * 0.55
     scale = min(target_area / max(1, dw), target_area / max(1, dh))
-    scale = min(scale, 1.0)  # never upscale
+    scale = min(scale, 1.0)
 
     new_dw = max(1, int(dw * scale))
     new_dh = max(1, int(dh * scale))
@@ -631,23 +590,19 @@ def apply_geometric_shape(
     paste_y = (sq_size - new_dh) // 2
     new_design.alpha_composite(cropped_scaled, dest=(paste_x, paste_y))
 
-    # --- Step 3: draw the geometric shape mask on the square canvas ---
     mask = np.zeros((sq_size, sq_size), dtype=np.uint8)
 
     if shape == "circle":
         radius = int(max(new_dw, new_dh) / 2 / 0.75 + border_px)
-        # constrain to canvas
         radius = min(radius, sq_size // 2 - 2)
         cv2.circle(mask, (cx, cy), radius, 255, -1)
 
     elif shape == "oval":
         ax_w = int((new_dw / 2) / 0.75 + border_px)
         ax_h = int((new_dh / 2) / 0.75 + border_px)
-        # ensure minimum aspect ratio so it looks oval
         min_ax = max(ax_w, ax_h)
         ax_w = max(ax_w, int(min_ax * 0.65))
         ax_h = max(ax_h, int(min_ax * 0.65))
-        # constrain to canvas
         ax_w = min(ax_w, sq_size // 2 - 2)
         ax_h = min(ax_h, sq_size // 2 - 2)
         cv2.ellipse(mask, (cx, cy), (ax_w, ax_h), 0, 0, 360, 255, -1)
@@ -676,7 +631,6 @@ def apply_geometric_shape(
         cv2.circle(mask, (rx1 + corner_r, ry2 - corner_r), corner_r, 255, -1)
         cv2.circle(mask, (rx2 - corner_r, ry2 - corner_r), corner_r, 255, -1)
 
-    # anti-alias edges
     aa_blur = max(3, int(border_px * 0.15))
     if aa_blur % 2 == 0:
         aa_blur += 1
@@ -781,7 +735,6 @@ def compose_final_preview(
     sticker_alpha: np.ndarray,
     material: str,
 ) -> tuple[Image.Image, Optional[str]]:
-    """LIGHT step: composites design onto sticker shape with material appearance."""
     texture_path = None
     w, h = design_img.size
     canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
@@ -812,7 +765,7 @@ def validate_upload(data: bytes, content_type: str) -> None:
     if size_mb > MAX_FILE_SIZE_MB:
         raise HTTPException(400, f"File too large: {size_mb:.1f}MB (max {MAX_FILE_SIZE_MB}MB)")
     if content_type and content_type not in VALID_FORMATS:
-        raise HTTPException(400, f"Unsupported format: {content_type}. Use PNG, JPEG, WebP, TIFF, or BMP.")
+        raise HTTPException(400, f"Unsupported format: {content_type}. Use PNG, JPEG, WebP, TIFF, BMP, or PDF.")
 
 
 def validate_dimensions(img: Image.Image) -> None:
@@ -863,8 +816,8 @@ def run_heavy_pipeline(
 
     result = {
         "padded_design": padded_design,
-        "alpha_mask": alpha_mask,           # raw design mask — needed to regenerate any shape
-        "sticker_alpha": sticker_alpha,     # contour-cut by default
+        "alpha_mask": alpha_mask,
+        "sticker_alpha": sticker_alpha,
         "bg_method": bg_method,
         "fhash": fhash,
         "cache_hit": False,
@@ -879,7 +832,7 @@ def run_heavy_pipeline(
 # ─────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"ok": True, "version": "36.1"}
+    return {"ok": True, "version": "36.2"}
 
 
 @app.get("/cache-stats")
@@ -894,7 +847,6 @@ async def process_sticker(
     shape: str = Form("contour-cut"),
     border_ratio: float = Form(0.028),
 ):
-    """Full pipeline: upload → mask (cached) → shape → compose."""
     if material not in VALID_MATERIALS:
         raise HTTPException(400, f"Unknown material: {material}")
     if shape not in VALID_SHAPES:
@@ -908,8 +860,6 @@ async def process_sticker(
 
         heavy = run_heavy_pipeline(data, border_ratio=border_ratio, for_preview=True)
 
-        # apply geometric shape (pads to square, centers design, draws shape mask)
-        # for contour-cut, returns original design + contour mask unchanged
         design_for_compose, sticker_alpha = apply_geometric_shape(
             heavy["padded_design"], heavy["alpha_mask"], shape, border_ratio
         )
@@ -925,7 +875,7 @@ async def process_sticker(
             "border_ratio": border_ratio,
             "material": material,
             "shape": shape,
-            "debug_version": "36.1",
+            "debug_version": "36.2",
             "debug_cache_hit": heavy["cache_hit"],
             "debug_texture_found": texture_path is not None,
             "debug_bg_method": heavy["bg_method"],
@@ -946,7 +896,6 @@ async def recompose(
     shape: str = Form("contour-cut"),
     border_ratio: float = Form(0.028),
 ):
-    """FAST endpoint: recomposes from cached data. Supports shape + material changes."""
     if material not in VALID_MATERIALS:
         raise HTTPException(400, f"Unknown material: {material}")
     if shape not in VALID_SHAPES:
@@ -959,7 +908,6 @@ async def recompose(
         raise HTTPException(404, "Cache miss — please re-upload via /process-sticker.")
 
     try:
-        # apply geometric shape (pads to square, centers design, draws shape mask)
         design_for_compose, sticker_alpha = apply_geometric_shape(
             cached["padded_design"], cached["alpha_mask"], shape, border_ratio
         )
@@ -974,7 +922,7 @@ async def recompose(
             "border_ratio": border_ratio,
             "material": material,
             "shape": shape,
-            "debug_version": "36.1",
+            "debug_version": "36.2",
             "debug_cache_hit": True,
             "debug_texture_found": texture_path is not None,
         })
@@ -1021,10 +969,6 @@ async def save_design(
     comment: str = Form(""),
     border_ratio: float = Form(0.028),
 ):
-    """
-    Called by frontend on 'Add to Cart'.
-    Saves design + specs to disk. NO PDF, NO email — that happens after payment.
-    """
     try:
         data = await file.read()
         validate_upload(data, file.content_type)
@@ -1041,7 +985,7 @@ async def save_design(
         }
         save_design_to_disk(token, data, meta)
 
-        return JSONResponse({"ok": True, "order_token": token, "debug_version": "36.1"})
+        return JSONResponse({"ok": True, "order_token": token, "debug_version": "36.2"})
     except HTTPException:
         raise
     except Exception as e:
@@ -1232,10 +1176,6 @@ def verify_wc_webhook(body: bytes, signature: str) -> bool:
 
 @app.post("/webhook/order-paid")
 async def webhook_order_paid(request: Request):
-    """
-    Called by WooCommerce AFTER payment confirmed.
-    Loads saved design → generates PDF → sends email to owner.
-    """
     body = await request.body()
 
     signature = request.headers.get("x-wc-webhook-signature", "")
@@ -1255,7 +1195,6 @@ async def webhook_order_paid(request: Request):
         customer_email = billing.get("email", "")
         customer_phone = billing.get("phone", "")
 
-        # find order_token in line items
         order_token = None
         stk_meta = {}
         for item in order.get("line_items", []):
